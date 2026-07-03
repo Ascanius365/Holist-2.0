@@ -1,0 +1,235 @@
+OutputItem,Qty,InputItem
+Oak Plank,1,Oak Log
+Stick,2,Oak Plank
+Torch,1,Stick
+Torch,1,Coal
+Crafting Table,4,Oak Plank
+Furnace,8,Cobblestone
+Chest,8,Oak Plank
+Wood Pickaxe,2,Stick
+Wood Pickaxe,3,Oak Plank
+Stone Pickaxe,2,Stick
+Stone Pickaxe,3,Stone Block
+Iron Pickaxe,2,Stick
+Iron Pickaxe,3,Iron Ingot
+Gold Pickaxe,2,Stick
+Gold Pickaxe,3,Gold Ingot
+Diamond Pickaxe,2,Stick
+Diamond Pickaxe,3,Diamond
+Wood Shovel,2,Stick
+Wood Shovel,1,Wooden Plank
+Stone Shovel,2,Stick
+Stone Shovel,1,Stone Block
+Iron Shovel,2,Stick
+Iron Shovel,1,Iron Ingot
+Gold Shovel,2,Stick
+Gold Shovel,1,Gold Ingot
+Diamond Shovel,2,Stick
+Diamond Shovel,1,Diamond
+Wood Axe,2,Stick
+Wood Axe,3,Wooden Plank
+Stone Axe,2,Stick
+Stone Axe,3,Stone Block
+Iron Axe,2,Stick
+Iron Axe,3,Iron Ingot
+Gold Axe,2,Stick
+Gold Axe,3,Gold Ingot
+Diamond Axe,2,Stick
+Diamond Axe,3,Diamond
+Wood Hoe,2,Stick
+Wood Hoe,2,Wooden Plank
+Stone Hoe,2,Stick
+Stone Hoe,2,Stone Block
+Iron Hoe,2,Stick
+Iron Hoe,2,Iron Ingot
+Gold Hoe,2,Stick
+Gold Hoe,2,Gold Ingot
+Diamond Hoe,2,Stick
+Diamond Hoe,2,Diamond
+Bucket,3,Iron Ingot
+Flint and Steel,1,Iron Ingot
+Flint and Steel,1,Flint
+Fire Charge,1,Blaze Powder
+Fire Charge,1,Coal
+Fire Charge,1,Gunpowder
+Fishing Rod,3,Stick
+Fishing Rod,2,String
+Carrot on a Stick,1,Fishing Rod
+Carrot on a Stick,1,Carrot
+Compass,4,Iron Ingot
+Compass,1,Redstone Dust
+Clock,4,Gold Ingot
+Clock,1,Redstone Dust
+Map,8,Paper
+Map,1,Compass
+Shear,2,Iron Ingot
+Wood Sword,1,Stick
+Wood Sword,2,Wooden Plank
+Stone Sword,1,Stick
+Stone Sword,2,Stone Block
+Iron Sword,1,Stick
+Iron Sword,2,Iron Ingot
+Gold Sword,1,Stick
+Gold Sword,2,Gold Ingot
+Diamond Sword,1,Stick
+Diamond Sword,2,Diamond
+Bow,3,Stick
+Bow,3,String
+Arrow,1,Flint
+Arrow,1,Stick
+Arrow,1,Feather
+Leather Helmet,5,Leather
+Iron Helmet,5,Iron Ingot
+Gold Helmet,5,Gold Ingot
+Diamond Helmet,5,Diamond
+Leather Chestplate,8,Leather
+Iron Chestplate,8,Iron Ingot
+Gold Chestplate,8,Gold Ingot
+Diamond Chestplate,8,Diamond
+Leather Legging,7,Leather
+Iron Legging,7,Iron Ingot
+Gold Legging,7,Gold Ingot
+Diamond Legging,7,Diamond
+Leather Boot,4,Leather
+Iron Boot,4,Iron Ingot
+Gold Boot,4,Gold Ingot
+Diamond Boot,4,Diamond
+Iron Block,9,Iron Ingot
+Gold Block,9,Gold Ingot
+Diamond Block,9,Diamond
+Emerald Block,9,Emerald
+Lapis Lazuli block,9,Lapis Lazuli
+Glowstone,4,Glowstone Dust
+Clay Block,4,Clay Ball
+Brick,4,Clay Brick
+Stone Brick,4,Stone Block
+Sandstone,4,Sand
+Smooth Sandstone,4,Sandstone
+Decorative Sandstone,2,Sandstone Slab
+Snow Block,4,Snowball
+Wool Block,4,String
+Wooden Slab,6,Wooden Plank
+Stone Slab,3,Stone
+Sandstone Slab,3,Sandstone
+Stone Brick Slab,3,Stone Brick
+Brick Slab,3,Brick
+Cobblestone Slab,3,Cobblestone
+Wood Stair,6,Wooden Plank
+Cobblestone Stair,6,Cobblestone
+Wood Door,6,Wooden Plank
+Iron Door,6,Iron Ingot
+Trapdoor,6,Wooden Plank
+Ladder,7,Stick
+Fence,6,Stick
+Fence Gate,4,Stick
+Fence Gate,2,Wooden Slab
+Nether Brick Fence,6,Nether Brick
+Cobblestone Wall,6,Cobblestone
+Mossy Cobblestone Wall,6,Mossy Cobblestone
+Iron Bar,6,Iron Ingot
+Glass Pane,6,Glass
+Bread,3,Wheat
+Mushroom Stew,1,Red Mushroom
+Mushroom Stew,1,Brown Mushroom
+Mushroom Stew,1,Bowl
+Cake,3,Milk
+Cake,2,Sugar
+Cake,1,Egg
+Cake,3,Wheat
+Cookie,2,Wheat
+Cookie,1,Cocoa Bean
+Pumpkin Pie,1,Pumpkin
+Pumpkin Pie,1,Sugar
+Pumpkin Pie,1,Egg
+Golden Carrot,8,Gold Nugget
+Golden Carrot,1,Carrot
+Golden Apple,8,Gold Nugget
+Golden Apple,1,Apple
+Enchanted Golden Apple,8,Gold Block
+Enchanted Golden Apple,1,Apple
+Melon,9,Melon Slice
+Paper,3,Sugar Cane
+Book,3,Paper
+Book,1,Leather
+Book and Quill,1,Book
+Book and Quill,1,Feather
+Book and Quill,1,Ink Sac
+Sign,6,Wooden Plank
+Sign,1,Stick
+Painting,8,Stick
+Painting,1,Wool
+Item Frame,8,Stick
+Item Frame,1,Leather
+Flower Pot,3,Brick
+Bowl,3,Wooden Plank
+Sugar,1,Sugar Cane
+Pumpkin Seed,1,Pumpkin
+Melon Seed,1,Melon Slice
+Glistening Melon,1,Melon Slice
+Glistening Melon,1,Gold Nugget
+Gold Ingot,9,Gold Nugget
+Bed,3,Wool
+Bed,3,Wooden Plank
+Beacon,5,Glass
+Beacon,1,Nether Star
+Beacon,3,Obsidian
+Cauldron,7,Iron Ingot
+Enchantment Table,1,Book
+Enchantment Table,2,Diamond
+Enchantment Table,4,Obsidian
+Ender Chest,8,Obsidian
+Ender Chest,1,Eye Of Ender
+Anvil,3,Iron Block
+Anvil,4,Iron Ingot
+Blaze Powder,1,Blaze Rod
+Brewing Stand,1,Blaze Rod
+Brewing Stand,3,Cobblestone
+Eye of Ender,1,Blaze Powder
+Eye of Ender,1,Ender Pearl
+Fermented Spider Eye,1,Spider Eye
+Fermented Spider Eye,1,Brown Mushroom
+Fermented Spider Eye,1,Sugar
+Bottle,3,Glass
+Magma Cream,1,Slime Ball
+Magma Cream,1,Blaze Powder
+Cooked Chicken,1,Raw Chicken
+Cooked Chicken,1,Fuel
+Cooked Porkchop,1,Raw Porkchop
+Cooked Porkchop,1,Fuel
+Steak,1,Raw Beef
+Steak,1,Fuel
+Cooked Fish,1,Raw Fish
+Cooked Fish,1,Fuel
+Baked Potato,1,Potato
+Baked Potato,1,Fuel
+Charcoal,1,Wood
+Charcoal,1,Fuel
+Iron Ingot,1,Iron Ore
+Iron Ingot,1,Fuel
+Gold Ingot,1,Gold Ore
+Gold Ingot,1,Fuel
+Glass,1,Sand
+Glass,1,Fuel
+Stone,1,Cobblestone
+Stone,1,Fuel
+Brick,1,Clay
+Brick,1,Fuel
+Nether Brick,1,Netherrack
+Nether Brick,1,Fuel
+Cactus Green,1,Cactu
+Cactus Green,1,Fuel
+Spruce Planks,1,Spruce Log
+Copper Helmet,5,Copper Ingot
+Copper Chestplate,8,Copper Ingot
+Copper Leggings,7,Copper Ingot
+Copper Boots,4,Copper Ingot
+Copper Axe,3,Copper Ingot
+Copper Pickaxe,3,Copper Ingot
+Copper Hoe,2,Copper Ingot
+Copper Shovel,1,Copper Ingot
+Copper Sword,2,Copper Ingot
+Copper Axe,2,Stick
+Copper Pickaxe,2,Stick
+Copper Hoe,2,Stick
+Copper Shovel,2,Stick
+Copper Sword,1,Stick

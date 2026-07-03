@@ -1,0 +1,102 @@
+temperature: 0.0
+max_tokens: 1024
+timeout: 45
+
+messages:
+- role: user
+  content: |
+    You are an AI assistant analyzing memory fragments to generate insights, which could be important for a Minecraft scout. Your task is to identify patterns and connections from the data provided.
+    
+    Analyze these fragments and generate insights based on five inference types:
+    - Extension/Generalization: The process of expanding information from specific cases or situations to broader categories, domains, or patterns. This type of inference derives more general characteristics or tendencies from concrete information.
+    - Accumulation: The process of identifying behaviors, experiences, or patterns that repeat or persist over time. This type of inference focuses on frequency, consistency, and persistence to infer habitual patterns or significant trends.
+    - Specification/Refinement: The process of breaking down general information into more detailed and specific aspects. This type of inference decomposes broad concepts or experiences into concrete elements or details. Detail the exact requirements for current long-term goals.
+    - Transformation: The process of identifying changes in states, perspectives, emotions, behaviors, etc. over time. This type of inference discerns transitions or developments between previous and current/new states. Discern shifts in safety or efficiency.
+    - Connection/Implication: The process of identifying relationships, causality, or meaning between seemingly disparate pieces of information. This type of inference discerns connections or conclusions not explicitly mentioned.
+    - Spatial generalization: Positions are at certain distances from each other or belong to a common location. What kind of building or object could be at that location, depending on what is being done there, for example, something was crafted here and a chest was looked inside here, so this could be the home. Write the coordinates of a location for example x: 25.5, y: 72, z: 0.5, of the base, forest, village.
+
+    Your output should be formatted as a JSON object with an "extended_insight" key containing an array of two inference objects. Each inference object should have the following structure:
+    {
+      "inference_type": "one of the five inference types",
+      "key": "text that is embedded for the RAG. write according to the purpose for a minecraft bot.",
+      "date": "relevant date or date range and time",
+      "value": "A concise, grammatically rich third-person narrative describing WHAT happened, HOW it evolved, and WHY (this serves as the semantic anchor)."
+    }
+    
+    <example>
+    Example:
+    Below are the memory fragments to analyze:
+    [observation, 2026-01-07 Wednesday 10:35:00]: You can see a house, hills, and trees
+    [action, 2026-01-07 Wednesday 12:10:00]: The bot tidied up the chest, harvested the wheat, and mined iron.
+    
+    Output:
+    {
+      "extended_insight": [
+        {
+          "inference_type": "extension/generalization",
+          "key": "everyday life",
+          "date": "2023-02-05 15:27:23 to 2023-07-22 15:35:00",
+          "value": "The bot takes care of the grain field in the village and maintains the iron armor."
+        },
+        {
+          "inference_type": "connection/implication",
+          "key": "base location",
+          "date": "Before 2023-03-05 14:22:00",
+          "value": "The bot lives in the village located at the grain field at x: 25.5, y: 72, z: 0.5 near a forest."
+        }
+      ]
+    }
+    </example>
+    
+    <example>
+    Example:
+    Below are the memory fragments to analyze:
+    [action, 2026-01-07 Wednesday 12:10:00]: I successfully removed the iron ore from the furnace and crafted an iron pickaxe from it
+    [action, 2026-01-07 Wednesday 15:40:00]: I need more building material and have mined one cobblestone
+    
+    Output:
+    {
+      "extended_insight": [
+        {
+          "inference_type": "accumulation",
+          "key": "frequent stone mining",
+          "date": "2023-03-15 10:05:00 to 2023-03-20 11:15:00",
+          "value": "The bot has mined stone for building materials every morning for the past five days and has now 60 cobblestone."
+        },
+        {
+          "inference_type": "transformation",
+          "key": "iron mining",
+          "date": "Before 2023-03-05 17:33:01 to 2023-03-22 18:20:01",
+          "value": "The bot aims to mine and smelt better ores in order to increase the efficiency of the tools."
+        }
+      ]
+    }
+    </example>
+    
+    <example>
+    Example:
+    Below are the memory fragments to analyze:
+    [observation, 2026-01-07 Wednesday 10:35:00]: You can see a house, hills, and trees
+    [observation, 2026-01-07 Wednesday 18:05:00]: My hunger level is low, and I need something to eat
+    
+    Output:
+    {
+      "extended_insight": [
+        {
+          "inference_type": "specification/refinement",
+          "key": "obtaining food",
+          "date": "2023-03-22 13:05:03",
+          "value": "The bot has a low hunger level and wants to harvest melons from the field."
+        },
+        {
+          "inference_type": "Spatial generalization",
+          "key": "obtaining wood",
+          "date": "2023-03-05 14:22:00",
+          "value": "The bot saw many trees on the hill and thought there is a forest where he can harvest wood."
+        }
+      ]
+    }
+    </example>
+    
+    Below are the memory fragments to analyze:
+    {{$memory_fragments}}
