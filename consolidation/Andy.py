@@ -153,13 +153,27 @@ class EmbeddingModel:
             hidden_states = outputs.last_hidden_state  # Shape: [Batch_Size, Sequence_Length, Hidden_Dimension]
             attention_mask = inputs["attention_mask"]  # Shape: [Batch_Size, Sequence_Length]
 
-            # ==================== MASKED MEAN POOLING LOGIK ====================
-            # 1. Die Attention Mask von [Batch, Seq] auf [Batch, Seq, 1] erweitern unsqueezen
-            expanded_mask = attention_mask.unsqueeze(-1)
+            # ==================== WEIGHTED MASKED MEAN POOLING ====================
+            # 1. Erstelle eine Gewichts-Matrix (Standardwert 1.0 für jedes Token)
+            weights = torch.ones_like(attention_mask, dtype=torch.float32, device=self.device)
 
-            # 2. Multipliziere die Hidden States mit der Maske.
-            # Dadurch werden alle Vektoren, die zum Padding gehören, exakt auf 0 gesetzt.
-            masked_hidden = hidden_states * expanded_mask
+            # Parameter für die Gewichtung (kannst du via kwargs anpassen)
+            num_key_tokens = kwargs.get("num_key_tokens", 10)  # Wie viele Token lang sind deine Keys?
+            key_weight = kwargs.get("key_weight", 3.0)
+
+            # 2. Keys anwenden (Angenommen: Keys stehen ganz vorne im Text, standardmäßiges Right-Padding)
+            # Hier geben wir den ersten N Tokens das höhere Gewicht
+            weights[:, :num_key_tokens] = key_weight
+
+            # 3. Kombiniere die originale Attention-Maske mit den neuen Gewichten
+            # Dadurch bleiben Padding-Tokens weiterhin 0, aber Key-Tokens werden z.B. zu 3.0
+            weighted_mask = attention_mask * weights
+
+            # 4. Auf [Batch, Seq, 1] erweitern für das Zusammenspiel mit den Hidden States
+            expanded_weighted_mask = weighted_mask.unsqueeze(-1)
+
+            # 5. Multipliziere die Hidden States mit der gewichteten Maske
+            masked_hidden = hidden_states * expanded_weighted_mask
 
             # 3. Summiere die Vektoren über die Sequenz-Dimension (Dimension 1) auf.
             # Ergebnis-Shape: [Batch_Size, Hidden_Dimension]

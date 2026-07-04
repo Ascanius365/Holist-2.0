@@ -137,12 +137,12 @@ class MCBot:
                 # Gather Observations
                 observation = observe(self.bot, self.mcData, self.chat_history_buffer, self.chat_history, self.event_history)
 
-                """
+
                 # Vision-Check (alle 5 Min)
                 current_time = time.time()
                 if current_time - self.last_vision_update >= 600:
                     asyncio.create_task(self.run_vision_background(observation))
-                    self.last_vision_update = current_time"""
+                    self.last_vision_update = current_time
 
 
                 # Send to YOUR OWN queue
@@ -294,8 +294,8 @@ class MCBot:
 if __name__ == '__main__':
 
     # Liste deiner simulierten Dorfbewohner
-    villagers = ["Caleb", "Dylan", "Kelly"]
-    #villagers =["Caleb"]
+    #villagers = ["Caleb", "Dylan", "Kelly"]
+    villagers =["Caleb"]
 
     bots = []
     base_port = 3001

@@ -415,7 +415,7 @@ def run_reasoning_consolidation(args, agent, bot_name, embed_req_q, embed_res_q,
     X_norm = X / np.linalg.norm(X, axis=1, keepdims=True)
 
     # eps=0.15 verlangt weiterhin eine Kosinus-Ähnlichkeit von 0.85 für Fusionen
-    eps_value = 0.025
+    eps_value = 0.04
 
     if num_items >= 1:
         # min_samples=1 erlaubt Single-Element-Cluster direkt nativ. Es gibt KEIN Rauschen (-1) mehr!
@@ -576,7 +576,8 @@ def run_reasoning_consolidation(args, agent, bot_name, embed_req_q, embed_res_q,
                 # Bilde eine lückenlose Beschreibung aus ALLEN Keys und Values des Clusters
                 if insights:
                     insight_list = []
-                    key_list = []
+                    keys = []
+                    values = []
                     for i in insights:
                         if i.get('value'):
                             key = i.get('key', '').strip()
@@ -587,11 +588,14 @@ def run_reasoning_consolidation(args, agent, bot_name, embed_req_q, embed_res_q,
                             insight_list.append(f"[{date}] {key}: {value}".strip(": "))
                             #key_list.append(f"{key} ")
                             # In run_reasoning.py beim Erstellen der Vektoren:
-                            key_list.append(
-                                    "Minecraft Bot Memory | Topic: " + key +
-                                    " | Context: " + value
-                            )
-                    description = ". ".join(key_list) if key_list else 'Summary'
+                            keys.append(key)
+                            values.append(value)
+
+                    clean_keys = ", ".join(keys)
+                    clean_values = " | ".join(values)
+
+                    description = f"Minecraft Bot Memory | Topics: {clean_keys} | Context: {clean_values}"
+                    #description = ". ".join(key_list) if key_list else 'Summary'
                 else:
                     description = 'Summary'
 

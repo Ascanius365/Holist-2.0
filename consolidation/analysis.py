@@ -139,7 +139,7 @@ def plot_memory_snapshot(
     else:
         reducer = umap.UMAP(
             n_neighbors=min(5, len(X) - 1),
-            min_dist=0.005,
+            min_dist=0.002,
             metric='cosine',
             random_state=42,
         )
