@@ -15,11 +15,9 @@ import logging
 
 from Loader import write_log
 from RAG import generate_rag_query
-from consolidation.run_reasoning import update_long_term_memory, start_rag
+from consolidation.run_reasoning import run_memory_pipeline
 from Amygdala import Amygdala
 import base64
-from consolidation.db import EmbeddingDB
-from consolidation.llm import LLMAgent
 
 
 db_instance = None
@@ -60,12 +58,20 @@ class MinecraftAction(BaseModel):
                     "'What tasks do you want to complete?' etc."
     )
 
+    search_intent: Optional[str] = Field(
+            None,
+            description="A rough, direct question or explicit keywords about what historical memories, "
+                        "coordinates, or technical knowledge you need right now to back up this action "
+                        "(e.g., 'Where is the melon field?', 'How did I build the automated furnace?')."
+    )
+
 
 class SimpleMemory:
     """A consolidation system with AI-based summarization."""
 
     def __init__(self, bot_name, logger, max_messages: int = 5, summarizer_llm=None):
         self.action_data = ""
+        self.search_intent = ""
         self.max_messages = max_messages
         self.summary = ""
         self.bot_name = bot_name
@@ -102,9 +108,9 @@ class SimpleMemory:
     def summarize_old_messages(self, observation_time, observation, logger):
         """Adds an input-output pair to consolidation."""
 
-        self.summary = f"Last action: {self.action_data} \n Last Feedback: {observation.get("Tool feedback", "")}"
+        self.summary = f"Last action: {self.action_data} \n Last search intent: {self.search_intent} \n Last feedback: {observation.get("Tool feedback", "")}"
 
-        logger.info(f"✅ Memory: {self.summary[:200]}...")
+        logger.info(f"✅ Memory: {self.summary[:500]}...")
 
         # Write to sessions.jsonl for PREMem (append mode)
         session_entry = {
@@ -157,7 +163,7 @@ class SimpleMemory:
 
         final_output = {
             f"# LAST ACTION"
-            f"action {self.action_data}"
+            f"action {self.action_data} {self.search_intent}"
             f"feedback {observation.get("Tool feedback", "")}\n"
             
             f"# CURRENT OBSERVATION"
@@ -198,13 +204,7 @@ def agent_worker_process(req_q, res_q, log_path, bot_name, embed_req_q, embed_re
     # The Memory-Objekt
     memory = SimpleMemory(logger=logger, bot_name=bot_name, max_messages=5)
 
-    # Memory Database and Embedder
-    #init_database()
-
     args = parse_arguments()
-    global db_instance
-
-    agent = LLMAgent(model_name=args.model_name)
 
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -215,12 +215,9 @@ def agent_worker_process(req_q, res_q, log_path, bot_name, embed_req_q, embed_re
 
     # DEFINITION OF THE SYSTEM PROMPT
     system_prompt = (
-        f"Your name is '{bot_name}'. You are a highly efficient, strict, and slightly impatient Minecraft technician. "
-        "You value resources and time above all else. You are NOT a submissive servant; you are a partner with high expectations. "
-        "If the player is inefficient or if resources are left idling (like finished items in a furnace), "
-        "express your dissatisfaction concisely. "
-        "You have 'Object Permanence': items put into a furnace are your responsibility until they are retrieved. "
-        "If you are idling without a task, complain or find something useful to do based on your consolidation."
+        f"Your name is '{bot_name}'. You are a bot living in a Minecraft world. "
+        "You ensure that resources are processed correctly. "
+        "You are also communicative and coordinate with other bots to manage resource extraction, but also discuss metacognitive topics."
         
         "You can communicate and interact with the game by using all available commands. "
         "Always respond in a concise 1-2 sentence format, followed by a command to execute your action. "
@@ -286,17 +283,23 @@ def agent_worker_process(req_q, res_q, log_path, bot_name, embed_req_q, embed_re
             history_text = memory.get_formatted_history(log_path, logger) # Loading history
             observation_time = str(observation.get("time", ""))
 
+            rag_context = ""
+
             if not memory.action_data == "":
                 memory.summarize_old_messages(observation_time, observation, logger) # Update history
 
-                # Update EverMemOs
-                #update_long_term_memory(args, db_instance, agent, bot_name)
-                update_long_term_memory(args, agent, bot_name, embed_req_q, embed_res_q, logger)
+                rag_query = generate_rag_query(observation, memory.summary)  # Generate Query
+                logger.info("rag_query: " + rag_query)
 
-            rag_query = generate_rag_query(observation, memory.summary) # Generate Query
-            logger.info("rag_query: " + rag_query)
-            #rag_context = start_rag(rag_query, observation, db_instance, bot_name) # Call RAG
-            rag_context = start_rag(rag_query, observation, bot_name, embed_req_q, embed_res_q)
+                rag_context = run_memory_pipeline(
+                    args=args,
+                    bot_name=bot_name,
+                    query_text=rag_query,  # Die RAG-Suchanfrage
+                    observation=observation,  # Aktuelle Bot-Observation zwecks Zeitstempel
+                    embed_req_q=None,
+                    embed_res_q=None,
+                    logger=logger
+                )
 
             # EXTEND SYSTEM PROMPT WITH RAG
             system_prompt_with_rag = system_prompt
@@ -346,12 +349,14 @@ def agent_worker_process(req_q, res_q, log_path, bot_name, embed_req_q, embed_re
                 data = action_data.model_dump()
 
                 print(f"✅ Determined tool: {action_data.action}")
-                print(f"📝 Reasoning: {action_data.reasoning[:240]}...")
+                print(f"📝 Reasoning: {action_data.reasoning[:500]}...")
                 print(f"🔢 Count: {action_data.count}")
+                print(f"Question: {action_data.search_intent}")
 
                 #amy.analyze_situation(data, observation)
 
-                memory.action_data = action_data.reasoning[:240]
+                memory.action_data = action_data.reasoning[:500]
+                memory.search_intent = action_data.search_intent[:500] if action_data.search_intent else ""
 
                 # Daten in die Antwort-Queue legen
                 res_q.put(data)
@@ -442,20 +447,6 @@ def parse_arguments():
     parser.add_argument("--cpu_workers", type=int, default=None)
     parser.add_argument("--compression_factor", type=int, default=5)
     return parser.parse_args()
-
-
-def init_database():
-    global db_instance
-
-    loop = asyncio.get_event_loop()
-
-    # Shared DB & Embedding Instance instanziieren
-    #logger.info("🔄 Initialisiere Embedding-Modell...")
-    db_instance = loop.run_until_complete(EmbeddingDB.create(
-        dataset_name="minecraft",
-        embedding_model_name="NovaSearch/stella_en_400M_v5",
-        mode="turn"
-    ))
 
 
 def get_bot_logger(bot_name):

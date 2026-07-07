@@ -43,50 +43,55 @@ def findBlock(bot, mcData, item):
 
 async def doFarming(bot, mcData, count):
 
-    if count == 1:
-        count = 10
+    try:
+        if count == 1:
+            count = 10
 
-    count = 1
+        count = 1
 
-    up = Vec3(0, 1, 0)
+        up = Vec3(0, 1, 0)
 
-    harvested = 0
+        harvested = 0
 
-    # Testing if its ripe
-    b = findBlock(bot, mcData, "wheat")
-    if not b:
-        return "The wheat is not yet ready to be harvested."
+        # Testing if its ripe
+        b = findBlock(bot, mcData, "wheat")
+        if not b:
+            return "The wheat is not yet ready to be harvested."
 
-    for i in range(count):
-        #b = findBlock(bot, mcData, "wheat")
-        b = findHarvestable(bot, 30)
-        if b:
-            await pathfind_to_goal(bot, b, "Wheat Crops")
-            try:
-                bot.dig(b)
-            except Exception as e:
-                #print("error while harvesting:",e)
-                return f"error while harvesting: {e}"
-            #time.sleep(0.2)
-            harvested += 1
-        else:
-            break
+        for i in range(count):
+            #b = findBlock(bot, mcData, "wheat")
+            b = findHarvestable(bot, 30)
+            if b:
+                await pathfind_to_goal(bot, b, "Wheat Crops")
+                try:
+                    bot.dig(b)
+                except Exception as e:
+                    #print("error while harvesting:",e)
+                    return f"error while harvesting: {e}"
+                #time.sleep(0.2)
+                harvested += 1
+            else:
+                break
 
-    # Collect all drops
-    await collect_drops(bot, mcData, "...")
+        # Collect all drops
+        await collect_drops(bot, mcData, "...")
 
-    wieldItem(bot, mcData, "wheat_seeds")
-    for i in range(1):
-        b = findSoil(bot, 30)
-        if b:
-            await pathfind_to_goal(bot, b, "Farmland")
-            try:
-                bot.placeBlock(b,up)
-            except Exception as e:
-                #print("error while planting:",e)
-                return f"error while planting: {e}"
-        else:
-            break
+        wieldItem(bot, mcData, "wheat_seeds")
+        for i in range(1):
+            b = findSoil(bot, 30)
+            if b:
+                await pathfind_to_goal(bot, b, "Farmland")
+                try:
+                    bot.placeBlock(b,up)
+                except Exception as e:
+                    #print("error while planting:",e)
+                    return f"error while planting: {e}"
+            else:
+                break
 
-    #print(f"You have successfully harvested {harvested}x Wheed.")
-    return f"You have successfully harvested {harvested}x Wheed."
+        #print(f"You have successfully harvested {harvested}x Wheed.")
+        return f"You have successfully harvested {harvested}x Wheed."
+
+    except Exception as e:
+        print("error while harvesting:",e)
+        return f"error while harvesting: {e}"

@@ -1,58 +1,91 @@
 import sys
-import asyncio
-import logging
-import sys
+import os
+import json
+import hashlib
+import re
+import ast
 import warnings
+import logging
+import requests
+import pandas as pd
+from datetime import datetime
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
-from tqdm import tqdm
-from sklearn.cluster import DBSCAN
-
-sys.path.append(".")
-from consolidation.io import read_jsonl, save_jsonl
+from neo4j import GraphDatabase
+import numpy as np
 
 warnings.filterwarnings("ignore")
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
-import os
-import pandas as pd
-import pickle
-import numpy as np
-import hashlib
-import json
-import re
-import ast
-from datetime import datetime
 
-import litellm
-#litellm._turn_on_debug()
+# =====================================================================
+# OPENROUTER RERANKER HELPER
+# =====================================================================
+def openrouter_rerank(query: str, documents: list, top_n: int = 4):
+    """
+    Nutzt den OpenRouter Rerank Endpunkt, um Dokumente semantisch bezüglich einer Query zu sortieren.
+    """
+
+    model = "nvidia/llama-nemotron-rerank-vl-1b-v2:free"
+
+    # Statt hart codiertem Key:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY ist nicht in den Umgebungsvariablen gesetzt!")
+
+    url = "https://openrouter.ai/api/v1/rerank"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-Title": "Holist Minecraft Agent"
+    }
+
+    formatted_docs = [{"text": doc} if isinstance(doc, str) else doc for doc in documents]
+
+    payload = {
+        "model": model,
+        "query": query,
+        "documents": formatted_docs,
+        "top_n": min(top_n, len(documents))
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        if response.status_code == 200:
+            return response.json().get("results", [])
+        else:
+            print(f"❌ OpenRouter Rerank Fehler: {response.text}")
+            return []
+    except Exception as e:
+        print(f"❌ Netzwerkfehler beim Reranking: {e}")
+        return []
 
 
+# =====================================================================
+# JSON PARSING & UTILS
+# =====================================================================
 def fix_incomplete_json(json_str, session_id="Unbekannt"):
-    # Falls es bereits ein Dictionary ist, direkt zurückgeben
     if isinstance(json_str, dict):
         return json_str
-
     if not isinstance(json_str, str):
         return {}
 
-    # Gedanken-Tags und Markdown-Codeblöcke entfernen
     if "<think>" in json_str:
         json_str = json_str.split("</think>")[-1].strip()
     json_str = json_str.replace("```json", "").replace("```", "").strip()
 
-    # --- SCHRITT 1: Direktes Laden versuchen ---
     try:
         return json.loads(json_str)
     except json.JSONDecodeError:
         pass
 
-    # --- SCHRITT 2: Intelligentes Schließen offener Anführungszeichen & Klammern ---
     fixed_str = json_str
     in_string = False
     escape = False
     stack = []
 
-    # Zeichen für Zeichen analysieren
     for char in fixed_str:
         if escape:
             escape = False
@@ -70,11 +103,9 @@ def fix_incomplete_json(json_str, session_id="Unbekannt"):
                 if stack:
                     stack.pop()
 
-    # Falls das LLM mitten in einem String abgebrochen ist (wie bei '"date": "')
     if in_string:
         fixed_str += '"'
 
-    # Alle noch offenen Klammern in umgekehrter Reihenfolge schließen (z.B. erst }, dann ], dann })
     while stack:
         open_char = stack.pop()
         if open_char == '{':
@@ -82,20 +113,17 @@ def fix_incomplete_json(json_str, session_id="Unbekannt"):
         elif open_char == '[':
             fixed_str += ']'
 
-    # --- SCHRITT 3: Reparierten String testen ---
     try:
         return json.loads(fixed_str)
     except json.JSONDecodeError:
         pass
 
-    # --- SCHRITT 4: Letzte Kommas entfernen (Trailing Commas, z.B. ,"_}) ---
     try:
         cleaned_str = re.sub(r',\s*([\]}])', r'\1', fixed_str)
         return json.loads(cleaned_str)
     except json.JSONDecodeError:
         pass
 
-    # --- SCHRITT 5: Python AST Fallback (für falsche Single Quotes) ---
     try:
         evaluated = ast.literal_eval(json_str)
         if isinstance(evaluated, dict):
@@ -103,952 +131,291 @@ def fix_incomplete_json(json_str, session_id="Unbekannt"):
     except (ValueError, SyntaxError):
         pass
 
-    # Wenn absolut gar nichts hilft, Fehler loggen
-    print(f"⚠️  JSON für Session '{session_id}' absolut nicht reparierbar!")
-    print(f"   Inhalt: {json_str[:120]}...")
-    return {}
-
-
-def fix_incomplete_json2(json_str):
-    """Parse JSON mit Fehlerbehandlung"""
-    if "<think>" in json_str:
-        json_str = json_str.split("</think>")[-1].strip()
-    json_str = json_str.replace("```json", "").replace("```", "").strip()
-
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError:
-        last_brace = json_str.rfind("}")
-        if last_brace != -1:
-            try:
-                return json.loads(json_str[:last_brace + 1])
-            except:
-                pass
+    print(f"⚠️ JSON für Session '{session_id}' nicht reparierbar!")
     return {}
 
 
 def get_fact_hash(fact_dict):
-    """Generiert einen eindeutigen MD5-Hash zur Deduplizierung von atomaren Fakten."""
+    insights_str = json.dumps(fact_dict.get('extended_insight', []), sort_keys=True)
     fact_str = json.dumps({
         'session_id': fact_dict.get('session_id'),
-        'key': fact_dict.get('key'),
-        'value': fact_dict.get('value'),
-        'date': fact_dict.get('date')
+        'date': fact_dict.get('date'),
+        'extended_insight': insights_str
     }, sort_keys=True)
     return hashlib.md5(fact_str.encode()).hexdigest()
 
 
-def update_long_term_memory(args, agent, bot_name, embed_req_q, embed_res_q, logger):
-    """
-    Stufe 1: Lädt neue Episoden/Einträge aus Memory/sessions.jsonl,
-    extrahiert Fakten, bettet sie ein, aktualisiert das unified_memory.pkl
-    und löscht erfolgreich verarbeitete Zeilen aus der Quelldatei.
-    """
-    input_file = f"bots/{bot_name}/memory/sessions.jsonl"
-    if not os.path.exists(input_file):
-        print(f"⚠️ {input_file} nicht gefunden. Überspringe Ingestion-Schritt.")
-        return
-
-    try:
-        with open(input_file, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-    except Exception as read_error:
-        print(f"❌ Fehler beim Lesen von {input_file}: {read_error}")
-        return
-
+def run_memory_pipeline(args, bot_name, query_text, observation, embed_req_q, embed_res_q, logger):
     bot_base_dir = f"bots/{bot_name}"
     os.makedirs(f"{bot_base_dir}/database", exist_ok=True)
-    unified_file = f"{bot_base_dir}/database/unified_memory.pkl"
+    unified_file = f"{bot_base_dir}/database/unified_memory.json"
+    input_file = f"bots/{bot_name}/memory/sessions.jsonl"
 
-    # Unified Memory laden oder neu initialisieren
     if os.path.exists(unified_file):
-        with open(unified_file, 'rb') as f:
-            unified_memory = pickle.load(f)
-        logger.info(f"✅ Unified Memory geladen ({len(unified_memory['facts'])} Fakten).")
+        with open(unified_file, 'r', encoding='utf-8') as f:
+            unified_memory = json.load(f)
     else:
         unified_memory = {
             'facts': [],
-            'metadata': {},
+            'processed_hashes': [],
+            'similarity_matrix': {},
             'cluster_summaries': [],
-            'processed_hashes': set(),
             'version': 1
         }
-        print("📝 Neues Unified Memory initialisiert.")
 
-    if 'processed_hashes' not in unified_memory:
-        unified_memory['processed_hashes'] = set()
+    if 'similarity_matrix' not in unified_memory:
+        unified_memory['similarity_matrix'] = {}
 
-    remaining_lines = []
-    info_list = []
+    active_lines = []
+    if os.path.exists(input_file):
+        with open(input_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        active_lines = [l for l in lines if l.strip()]
 
-    # Zeilen einzeln verarbeiten und validieren
-    for i, line in enumerate(lines):
-        if not line.strip():
-            continue
+    dirty_clusters = [c for c in unified_memory.get('cluster_summaries', []) if c.get('needs_consolidation', False)]
 
-        data = None
-        extra_text = ""
+    # Hier sammeln wir sowohl neue Fakten als auch aktualisierte Cluster-Summaries
+    new_memory_entries = []
 
-        try:
-            # Versuch 1: Normales Laden
-            data = json.loads(line)
-        except json.JSONDecodeError as e:
-            # ==================== NEU: AUTOMATISCHER SPLIT BEI EXTRA DATA ====================
-            # Falls gültiges JSON + Freitext in einer Zeile stehen, trennen wir sie hier sauber auf.
-            if "Extra data" in e.msg:
-                try:
-                    json_part = line[:e.pos].strip()
-                    extra_text = line[e.pos:].strip()
-                    data = json.loads(json_part)  # Lädt die Session-Metadaten
-                except Exception:
-                    data = None
+    if active_lines or dirty_clusters:
+        logger.info("⚡ Starte asynchrone parallele Batch-Verarbeitung über ThreadPool...")
+        tasks = []
 
-            # Falls es reiner Freitext ohne jegliches JSON-Format war (z.B. Zeile startet nicht mit '{')
-            if not data:
-                clean_line = line.strip()
-                if clean_line and not clean_line.startswith("{"):
-                    data = {
-                        "session_id": f"mc_{i}",
-                        "session_date": "2024-01-01",
-                        "text": clean_line
-                    }
-                else:
-                    # Wirklich kaputtes JSON
-                    print(f"⚠️ Ungültiges JSON in Zeile {i + 1}: {str(e)[:80]}")
-                    remaining_lines.append(line)
-                    continue
-            # ==================================================================================
+        with ThreadPoolExecutor() as executor:
+            # TASK A: Neue Session-Zeilen absenden
+            if active_lines:
+                for line_idx, line in enumerate(active_lines):
+                    try:
+                        data = json.loads(line)
+                        inf_type = data.get("information_type") or data.get("type") or "observation"
+                        date_str = data.get("session_date") or data.get("date") or datetime.now().strftime(
+                            "%Y-%m-%d %A %H:%M:%S")
+                        text_str = data.get("text") or data.get("response") or ""
+                        if isinstance(text_str, dict):
+                            text_str = json.dumps(text_str)
+                        single_fragment_text = f"[{inf_type.lower()}, {date_str}]: {text_str}\n"
+                    except json.JSONDecodeError:
+                        single_fragment_text = f"[observation, {datetime.now().strftime('%Y-%m-%d')}]: {line.strip()}\n"
 
-        try:
-            if not isinstance(data, dict):
-                print(f"⚠️ Zeile {i + 1} ist kein gültiges JSON-Objekt (Überspringe).")
-                remaining_lines.append(line)
-                continue
+                    future_frag = executor.submit(run_llm_reasoning_info, single_fragment_text, bot_name)
+                    tasks.append({"type": "fragments", "future": future_frag, "text": single_fragment_text,
+                                  "line_idx": line_idx})
 
-            # Text aus dem JSON holen und den extrahierten Freitext anhängen
-            response = data.get("response") or data.get("text", "")
-            if extra_text:
-                if response:
-                    response = f"{response}\n{extra_text}".strip()
-                else:
-                    response = extra_text
+            # TASK B: Gedriftete Cluster zur Neukonsolidierung absenden
+            if dirty_clusters:
+                fact_map = {get_fact_hash(f): f for f in unified_memory.get('facts', [])}
+                for cluster in dirty_clusters:
+                    c_id = cluster.get("cluster_id")
+                    hashes = cluster.get("associated_hashes", [])
+                    cluster_facts = [fact_map[h] for h in hashes if h in fact_map]
 
-            if not response:
-                # Zeile enthält keinen Inhalt, gilt als verarbeitet
-                continue
-
-            # Falls die Antwort bereits ein Dict (JSON) ist, direkt nutzen
-            if isinstance(response, dict):
-                info = response
-            elif isinstance(response, str) and response.strip():
-                clean_response = response.strip()
-
-                # Nur wenn der Text mit '{' beginnt, versuchen wir eine JSON-Reparatur
-                if clean_response.startswith("{"):
-                    info = fix_incomplete_json(clean_response, data.get('session_id', 'Unbekannt'))
-                else:
-                    info = None  # Reiner Freitext, überspringe Reparatur-Funktion
-
-                # TEXT-ZU-FAKT KONVERTIERUNG
-                if not info:
-                    info = {
-                        "Episodic_Fact": [
-                            {
-                                "key": "Agent_Observation",
-                                "value": clean_response
-                            }
-                        ]
-                    }
-            else:
-                info = None
-
-            if not info:
-                remaining_lines.append(line)
-                continue
-
-            # Extraktion aller Informationstypen
-            for info_type, values in info.items():
-                if not isinstance(values, list):
-                    continue
-                for v in values:
-                    if not v.get("value"):
+                    if not cluster_facts:
+                        cluster["needs_consolidation"] = False
                         continue
-                    info_list.append({
-                        "session_id": data.get("session_id", f"mc_{i}"),
-                        "text": data.get("text", response if isinstance(response, str) else ""),
-                        "session_date": data.get("session_date", ""),
-                        "information_type": info_type,
-                        "key": v.get("key", "info"),
-                        "value": v["value"],
-                        "date": v.get("date", "2024-01-01"),
-                        "message_id": v.get("message_id", "m0")
-                    })
-        except Exception as e:
-            print(f"❌ Unerwarteter Fehler in Zeile {i + 1}: {e}")
-            remaining_lines.append(line)
 
-    if not info_list:
-        print("✅ Keine extrahierbaren Informationen in sessions.jsonl gefunden.")
-        # Quelldatei aktualisieren (bereinigen)
-        with open(input_file, 'w', encoding='utf-8') as f:
-            f.writelines(remaining_lines)
-        return
+                    cluster_text = ""
+                    for f in cluster_facts:
+                        for insight in f.get('extended_insight', []):
+                            inf_type = insight.get('inference_type', 'Fact')
+                            date_str = insight.get('date', f.get('date', datetime.now().strftime("%Y-%m-%d")))
+                            cluster_text += f"[{inf_type.lower()}, {date_str}]: {insight.get('key')}: {insight.get('value')}\n"
 
-    # Filterung auf Duplikate
-    new_facts = []
-    for fact in info_list:
-        fact_hash = get_fact_hash(fact)
-        if fact_hash not in unified_memory['processed_hashes']:
-            new_facts.append(fact)
+                    future_cluster = executor.submit(run_llm_reasoning_info, cluster_text, bot_name)
+                    tasks.append({"type": "cluster", "cluster_obj": cluster, "future": future_cluster})
 
-    if not new_facts:
-        print("✅ Alle extrahierten Fakten existieren bereits im Langzeitgedächtnis.")
-        with open(input_file, 'w', encoding='utf-8') as f:
-            f.writelines(remaining_lines)
-        return
+            # TASK C: Ergebnisse einsammeln
+            processed_hashes_set = set(unified_memory.get('processed_hashes', []))
+            for task in tasks:
+                try:
+                    llm_res = task["future"].result()
+                    if not llm_res or not isinstance(llm_res, dict):
+                        continue
 
-    logger.info(f"➕ Generiere Embeddings für {len(new_facts)} neue Fakten...")
-    info_df = pd.DataFrame(new_facts)
-    text_for_embed = (info_df["key"] + ": " + info_df["value"].astype(str)).tolist()
+                    # Trenne Insights und Query sauber auf
+                    insights = llm_res.get("extended_insight", [])
+                    query_text = llm_res.get("query", "")
 
-    #all_embeddings = db.embedder.create(text_for_embed)
-    all_embeddings = get_shared_embedding(text_for_embed, bot_name, embed_req_q, embed_res_q)
+                    if task["type"] == "fragments":
+                        print("Generated a fact")
+                        fact_dict = {
+                            "session_id": f"reasoned_{datetime.now().strftime('%Y%m%d_%H%M%S')}_line{task['line_idx']}",
+                            "text": task["text"],
+                            "date": insights[0].get("date", datetime.now().strftime(
+                                "%Y-%m-%d")) if insights else datetime.now().strftime("%Y-%m-%d"),
+                            "query": query_text,  # 🚀 NEU: Query wird im Fakt gespeichert
+                            "extended_insight": insights,
+                            "type": "fact"  # Identifikator
+                        }
+                        if get_fact_hash(fact_dict) not in processed_hashes_set:
+                            new_memory_entries.append(fact_dict)
 
-    # In Unified Memory einspeisen
-    before_count = len(unified_memory['facts'])
-    for emb, meta in zip(all_embeddings, new_facts):
-        unified_memory['facts'].append(emb)
-        unified_memory['metadata'][len(unified_memory['facts']) - 1] = meta
-        unified_memory['processed_hashes'].add(get_fact_hash(meta))
+                    elif task["type"] == "cluster":
+                        print("Generated a Cluster")
+                        cluster = task["cluster_obj"]
+                        cluster["extended_insight"] = insights
+                        cluster["query"] = query_text  # 🚀 NEU
+                        cluster["needs_consolidation"] = False
+                        c_id = cluster.get("cluster_id")
 
-    logger.info(f"💾 {len(all_embeddings)} neue Fakten hinzugefügt ({before_count} ➔ {len(unified_memory['facts'])} gesamt).")
+                        # WICHTIG: Alte Version der Summary dieses Clusters aus den lokalen Listen löschen
+                        unified_memory['facts'] = [f for f in unified_memory.get('facts', []) if not (
+                                f.get('type') == 'cluster_summary' and f.get('cluster_id') == c_id)]
 
-    # Unified Memory wegschreiben
-    with open(unified_file, 'wb') as f:
-        pickle.dump(unified_memory, f)
+                        cluster_fact = {
+                            "session_id": f"cluster_summary_{c_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                            "date": datetime.now().strftime("%Y-%m-%d"),
+                            "query": query_text,  # 🚀 NEU
+                            "extended_insight": insights,
+                            "type": "cluster_summary",  # Identifikator
+                            "cluster_id": c_id
+                        }
+                        new_memory_entries.append(cluster_fact)
+                        print(f"✅ Parallel-Ergebnis: Cluster {c_id} erfolgreich als Summary-Fakt konsolidiert.")
 
-    # Quelldatei aktualisieren (erfolgreiche Zeilen löschen)
-    with open(input_file, 'w', encoding='utf-8') as f:
-        f.writelines(remaining_lines)
-    logger.info(f"🧹 {input_file} aktualisiert. {len(remaining_lines)} Zeilen verbleiben.")
+                except Exception as thread_err:
+                    logger.error(f"❌ Fehler bei der parallelen Thread-Ausführung: {thread_err}")
 
-    run_reasoning_consolidation(args, agent, bot_name, embed_req_q, embed_res_q, logger)
+    # =====================================================================
+    # 3. UNIFIZIERTES MATRIX-UPDATE FÜR FAKTEN & CLUSTER-SUMMARIES
+    # =====================================================================
+    if new_memory_entries:
+        logger.info(
+            f"📊 Matrix-Update: Berechne Ähnlichkeiten für {len(new_memory_entries)} neue Einträge (Fakten & Summaries)...")
 
+        all_top_matches = []
+        all_deleted_hashes = set()
 
-def get_md5_hash(text: str) -> str:
-    return hashlib.md5(text.encode()).hexdigest()
+        for new_entry in new_memory_entries:
+            # Erzeugt eine saubere, ausformulierte Beschreibung aus den Insights für den Reranker
+            if 'extended_insight' in new_entry and not new_entry.get('description'):
+                new_entry['description'] = " ".join([i.get('value', '') for i in new_entry['extended_insight']])
+            existing_facts = unified_memory.get('facts', [])
+            pool = []
+            new_hash = get_fact_hash(new_entry)
+            new_query = new_entry.get('query', '')
 
+            if existing_facts:
+                for f in existing_facts:
+                    text_content = f.get('description', '')
+                    pool.append(f"[{f.get('date', 'N/A')}] ({f.get('type', 'fact')}) {text_content}")
 
-async def async_batch_process_tasks_and_save(tasks, params, output_path, batch_size=128):
-    for i in tqdm(range(0, len(tasks), batch_size)):
-        batch_tasks = tasks[i: i + batch_size]
-        batch_results = await asyncio.gather(*[asyncio.wait_for(t, timeout=60) for t in batch_tasks],
-                                             return_exceptions=True)
+            rerank_results = []
+            if pool:
+                print(f"🔎 Reranking neuen {new_entry['type']} gegen {len(pool)} bestehende Einträge...")
+                rerank_results = openrouter_rerank(query=new_query, documents=pool, top_n=len(pool))
 
-        new_data = []
-        for response, param in zip(batch_results, params[i: i + batch_size]):
-            # ==================== GEÄNDERT: FEHLER NICHT MEHR VERSCHLUCKEN ====================
-            if isinstance(response, Exception):
-                print(f"\n❌ LiteLLM API-Fehler im Cluster {param.get('cluster_id')}: {response}")
-                continue
-            if response is None:
-                continue
-            # ==================================================================================
-            if isinstance(response, Exception) or response is None:
-                continue
-            new_data.append({**param, **response.to_dict()})
+            if new_hash not in unified_memory['similarity_matrix']:
+                unified_memory['similarity_matrix'][new_hash] = {}
 
-        if os.path.exists(output_path):
-            existing = read_jsonl(output_path)
-            save_jsonl(existing + new_data, output_path)
-        else:
-            save_jsonl(new_data, output_path)
+            # Set zum Sammeln von redundanten Altfakten (Score > 0.9)
+            hashes_to_delete = set()
 
+            for res in rerank_results:
+                rel_idx = res['index']
+                score = res['relevance_score']
 
-def run_reasoning_consolidation(args, agent, bot_name, embed_req_q, embed_res_q, logger):
-    loop = asyncio.get_event_loop()
+                target_fact = existing_facts[rel_idx]
+                target_hash = get_fact_hash(target_fact)
 
-    # ============ ÄNDERUNG 1: Lade unified_memory.pkl ============
-    bot_base_dir = f"bots/{bot_name}"
-    os.makedirs(f"{bot_base_dir}/database", exist_ok=True)
-    unified_file = f"{bot_base_dir}/database/unified_memory.pkl"
-    if not os.path.exists(unified_file):
-        print(f"❌ Fehler: {unified_file} nicht gefunden!")
-        return
+                # 🎯 Redundanz-Filter: Wenn die Ähnlichkeit > 0.9 ist, wird der alte Eintrag vorgemerkt
+                if score > 0.95:
+                    print(
+                        f"🗑️ Redundanz erkannt: Fakt {target_hash} hat Score {score:.4f} > 0.95 und wird gelöscht.")
+                    hashes_to_delete.add(target_hash)
+                    all_deleted_hashes.add(target_hash)
+                    continue  # Keine Kante für diesen gelöschten Fakt erstellen
 
-    with open(unified_file, 'rb') as f:
-        unified_memory = pickle.load(f)
+                # Rein gerichtete Verknüpfung (Vom neuen Fakt zum alten)
+                unified_memory['similarity_matrix'][new_hash][target_hash] = score
 
-    logger.info(f"✅ Loaded unified consolidation:")
-    logger.info(f"   - Fakten: {len(unified_memory['facts'])}")
-    logger.info(f"   - Cluster-Summaries: {len(unified_memory.get('cluster_summaries', []))}")
+                all_top_matches.append((score, target_fact))
 
-    # ============ ÄNDERUNG 2: Erstelle kombinierte Embedding-Matrix ============
-    # Fakten + alte Cluster-Summaries
-    facts_embeddings = np.array(unified_memory['facts']) if unified_memory['facts'] else np.array([])
-    cluster_summaries = unified_memory.get('cluster_summaries', [])
-    cluster_embeddings = np.array([s['embedding'] for s in cluster_summaries]) if cluster_summaries else np.array([])
+            # 🛠️ Bereinigung des lokalen Speichers nach dem Reranking dieses Eintrags
+            if hashes_to_delete:
+                # 1. Aus der Liste der Fakten entfernen
+                unified_memory['facts'] = [f for f in unified_memory['facts'] if
+                                           get_fact_hash(f) not in hashes_to_delete]
 
-    # Kombiniere
-    if len(facts_embeddings) > 0 and len(cluster_embeddings) > 0:
-        X = np.vstack([facts_embeddings, cluster_embeddings])
-    elif len(facts_embeddings) > 0:
-        X = facts_embeddings
-    elif len(cluster_embeddings) > 0:
-        X = cluster_embeddings
+                # 2. Aus den verarbeiteten Hashes filtern
+                unified_memory['processed_hashes'] = [h for h in unified_memory['processed_hashes'] if
+                                                      h not in hashes_to_delete]
+
+                # 3. Aus der Ähnlichkeitsmatrix komplett austragen
+                for h in hashes_to_delete:
+                    unified_memory['similarity_matrix'].pop(h, None)
+                for source_hash in unified_memory['similarity_matrix']:
+                    for h in hashes_to_delete:
+                        unified_memory['similarity_matrix'][source_hash].pop(h, None)
+
+            # Jetzt erst den neuen Eintrag lokal anhängen
+            unified_memory['facts'].append(new_entry)
+            if new_hash not in unified_memory['processed_hashes']:
+                unified_memory['processed_hashes'].append(new_hash)
+
+        # Speicher sichern
+        with open(unified_file, 'w', encoding='utf-8') as f:
+            json.dump(unified_memory, f, indent=2, ensure_ascii=False)
+
+        db_name = bot_name.lower()
+
+        try:
+            unified_memory = sync_memory_to_neo4j(
+                unified_memory,
+                database=db_name,  # 🎯 Hier wird die bot-spezifische DB übergeben
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "eher2015")
+            )
+            logger.info(f"💾 Alle Daten erfolgreich mit Neo4j (Datenbank: {db_name}) abgeglichen.")
+        except Exception as neo_err:
+            logger.error(f"❌ Neo4j-Pipeline für Datenbank '{db_name}' fehlgeschlagen: {neo_err}")
+
+        # Speicher sichern
+        with open(unified_file, 'w', encoding='utf-8') as f:
+            json.dump(unified_memory, f, indent=2, ensure_ascii=False)
+
+        if os.path.exists(input_file) and active_lines:
+            with open(input_file, 'w', encoding='utf-8') as f:
+                f.writelines([])  # Verarbeitete Zeilen leeren
+
+        # =====================================================================
+        # 4. RETRIEVAL / FEEDBACK FÜR RAG (Top 10 ähnlichste Elemente)
+        # =====================================================================
+        # Sortiere alle gemessenen Matches global nach Relevanz-Score absteigend
+        all_top_matches.sort(key=lambda x: x[0], reverse=True)
+
+        seen_hashes = set()
+        unique_top_matches = []
+
+        for score, fact in all_top_matches:
+            f_hash = get_fact_hash(fact)
+            # Nur aufnehmen, wenn der Fakt überlebt hat und noch nicht in den Top-Matches ist (Deduplizierung)
+            if f_hash not in seen_hashes and f_hash not in all_deleted_hashes:
+                seen_hashes.add(f_hash)
+                unique_top_matches.append((score, fact))
+                if len(unique_top_matches) >= 10:
+                    break
+
+        results_strings = []
+        for score, f in unique_top_matches:
+            results_strings.append(f"- ({f.get('type', 'fact')}) [Score: {score:.4f}]: {f.get('description', '')}")
+
     else:
-        print("❌ Keine Fakten und keine Summaries gefunden!")
-        return
+        results_strings = []
 
-    num_items = len(X)
-    num_facts = len(facts_embeddings)
-    fact_offset = num_facts  # Index ab dem Summaries beginnen
+    feedback_block = "\n".join(results_strings) if results_strings else "- No highly similar context items found or no new entries processed."
+    return f"### Abstract ideas as feedback:\n{feedback_block}\n"
 
-    print(f"{bot_name}: 📊 Clustering {num_items} items ({num_facts} facts + {len(cluster_summaries)} summaries)...")
-    """
-    # ============ ÄNDERUNG 3: Clustering ============
-    raw_target = num_items // args.compression_factor
-    clamped_target = max(2, min(10, raw_target))
-    target_clusters = min(clamped_target, num_items)"""
 
-    # ============ ÄNDERUNG 3: Dichte-basiertes Clustering via DBSCAN (min_samples=1) ============
-    X_norm = X / np.linalg.norm(X, axis=1, keepdims=True)
-
-    # eps=0.15 verlangt weiterhin eine Kosinus-Ähnlichkeit von 0.85 für Fusionen
-    eps_value = 0.04
-
-    if num_items >= 1:
-        # min_samples=1 erlaubt Single-Element-Cluster direkt nativ. Es gibt KEIN Rauschen (-1) mehr!
-        dbscan = DBSCAN(eps=eps_value, min_samples=1, metric='cosine')
-        labels = dbscan.fit_predict(X_norm)
-
-        unique_labels = [int(l) for l in np.unique(labels)]
-        target_clusters = len(unique_labels)
-        print(f"{bot_name}: 📊 DBSCAN (min_samples=1) abgeschlossen. Cluster gesamt: {target_clusters}")
-    else:
-        labels = np.array([])
-        unique_labels = []
-        target_clusters = 0
-
-    # ============ Analysis before consolidation
-    try:
-        from consolidation.analysis import plot_memory_snapshot
-        plot_memory_snapshot(bot_name = bot_name,
-                             state="before", labels=labels)
-    except Exception as plot_err:
-        print(f"⚠️  Konnte Vor-Consolidation-Snapshot nicht erstellen: {plot_err}")
-
-
-    all_keys = []
-    all_tasks = []
-
-    # ============ ÄNDERUNG 4: Für jeden Cluster entscheiden: neue Summary oder alte behalten ============
-    clusters_info = []
-    new_summaries_to_create = []  # Nur Cluster mit neuen Fakten
-    old_summaries_to_keep = []  # Cluster nur mit alten Summaries
-
-    run_id = pd.Timestamp.now().strftime("%Y%m%d%H%M%S%f")
-
-    for c_id in range(target_clusters):
-        cluster_indices = np.where(labels == c_id)[0]
-        cluster_indices_list = cluster_indices.tolist()
-
-        # Prüfe ob neue Fakten in diesem Cluster sind
-        has_new_facts = any(idx < fact_offset for idx in cluster_indices_list)
-        num_items_in_cluster = len(cluster_indices_list)
-        has_old_summary = any(idx >= fact_offset for idx in cluster_indices_list)
-
-        print(
-            f"   Cluster {c_id}: {len(cluster_indices)} items ({sum(1 for i in cluster_indices_list if i < fact_offset)} facts, "
-            f"{sum(1 for i in cluster_indices_list if i >= fact_offset)} summaries)")
-
-        # ============ ÄNDERUNG 5: NUR wenn neue Fakten = neuer Reasoning-Task ============
-        #if has_new_facts:
-        if has_new_facts or (num_items_in_cluster > 1):
-            memory_fragments_list = []
-
-            for idx in cluster_indices_list:
-                if idx < fact_offset:
-                    # Neuer Fakt
-                    meta = unified_memory['metadata'].get(idx, {})
-                    memory_fragments_list.append(
-                        f"[{meta.get('key', 'info')}, {meta.get('session_date', 'N/A')}]: "
-                        f"{meta.get('role', 'user')} {meta.get('value', '')}"
-                    )
-                else:
-                    # Alte Summary
-                    summary_idx = idx - fact_offset
-                    summary = cluster_summaries[summary_idx]
-                    memory_fragments_list.append(
-                        f"[EXISTING CLUSTER] {summary['description']}"
-                    )
-
-            # Beteiligte alte Summaries merken (für Fallback, falls der LLM-Call fehlschlägt)
-            involved_old_summaries = [
-                cluster_summaries[idx - fact_offset]
-                for idx in cluster_indices_list if idx >= fact_offset
-            ]
-            involved_fact_values = [
-                unified_memory['metadata'].get(idx, {}).get('value', '')
-                for idx in cluster_indices_list if idx < fact_offset
-            ]
-
-            memory_fragments = "\n\n--- Nächste ---\n\n".join(memory_fragments_list)
-
-            unique_cluster_id = f"{run_id}_{c_id}"
-
-            cluster_info = {
-                "cluster_id": unique_cluster_id,
-                "kmeans_label": int(c_id),
-                "fact_indices": cluster_indices_list,
-                "size": len(cluster_indices),
-                "has_new_facts": True,
-                "involved_old_summaries": involved_old_summaries,  # NEU
-                "involved_fact_values": involved_fact_values,
-            }
-            clusters_info.append(cluster_info)
-            new_summaries_to_create.append(c_id)
-
-            all_keys.append({
-                "cluster_id": unique_cluster_id,
-                "kmeans_label": int(c_id),
-                "item_count": len(cluster_indices),
-                "cluster_hash": hashlib.md5(str(cluster_indices).encode()).hexdigest()
-            })
-
-            all_tasks.append(agent.get_completion(
-                "consolidation/reason_info.yaml",
-                memory_fragments=memory_fragments,
-                api_base=args.api_base
-            ))
-        else:
-            # ============ ÄNDERUNG 6: Keine neuen Fakten = alte Summary behalten ============
-            logger.info(f"   ⏭️  Cluster {c_id} hat nur alte Summaries → behalte unverändert")
-
-            for idx in cluster_indices_list:
-                summary_idx = idx - fact_offset
-
-                old_summary = cluster_summaries[summary_idx]
-
-                # NEU: Als nicht konsolidiert markieren
-                old_summary['consolidated'] = False
-                old_summary['kmeans_label'] = None
-
-                old_summaries_to_keep.append(old_summary)
-
-    print(f"{bot_name}: ➕ Erstelle {len(new_summaries_to_create)} neue Summaries")
-    print(f"{bot_name}: ⏭️  Behalte {len(old_summaries_to_keep)} alte Summaries unverändert")
-
-    if not all_tasks:
-        print("✅ Keine neuen Fakten in Clustern → behalte alle alten Summaries")
-        # NEU: Alle bestehenden auf False setzen
-        for s in unified_memory.get('cluster_summaries', []):
-            s['consolidated'] = False
-        # Speichere unverändert
-        with open(unified_file, 'wb') as f:
-            pickle.dump(unified_memory, f)
-        return
-
-    # ============ ÄNDERUNG 7: Asynchrone Verarbeitung ============
-    output_file = f"bots/{bot_name}/database/ours_reasoning.jsonl"
-    if os.path.exists(output_file):
-        os.remove(output_file)
-
-    loop.run_until_complete(async_batch_process_tasks_and_save(
-        all_tasks, all_keys, output_file, batch_size=args.batch_size
-    ))
-
-    # ============ ÄNDERUNG 8: Extrahiere neue Summaries ============
-    new_summaries = old_summaries_to_keep  # Starte mit den beibehaltenen alten
-
-    if os.path.exists(output_file):
-        reasoning_results = read_jsonl(output_file)
-
-        pending_new_summaries = []
-        for result in reasoning_results:
-            response_text = result.get('response', '')
-            # Nutze deine passende JSON-Fix-Funktion aus dem Skript
-            resp = fix_incomplete_json(response_text)
-
-            if resp and "extended_insight" in resp:
-                insights = resp.get('extended_insight', [])
-
-                # Bilde eine lückenlose Beschreibung aus ALLEN Keys und Values des Clusters
-                if insights:
-                    insight_list = []
-                    keys = []
-                    values = []
-                    for i in insights:
-                        if i.get('value'):
-                            key = i.get('key', '').strip()
-                            value = i.get('value', '').strip()
-                            date = i.get('date', 'N/A').strip()
-
-                            # Format: "[Datum] Key: Value"
-                            insight_list.append(f"[{date}] {key}: {value}".strip(": "))
-                            #key_list.append(f"{key} ")
-                            # In run_reasoning.py beim Erstellen der Vektoren:
-                            keys.append(key)
-                            values.append(value)
-
-                    clean_keys = ", ".join(keys)
-                    clean_values = " | ".join(values)
-
-                    description = f"Minecraft Bot Memory | Topics: {clean_keys} | Context: {clean_values}"
-                    #description = ". ".join(key_list) if key_list else 'Summary'
-                else:
-                    description = 'Summary'
-
-                summary = {
-                    'timestamp': pd.Timestamp.now().isoformat(),
-                    'cluster_id': result.get('cluster_id'),
-                    'kmeans_label': result.get('kmeans_label'),
-                    'item_count': result.get('item_count'),
-                    'description': description,
-                    'response': response_text,
-                    'insights': insights,
-                    'embedding': None,  # Wird gleich im Batch befüllt
-                    'consolidated': True
-                }
-                pending_new_summaries.append(summary)
-
-        # Zusammenführen mit den beibehaltenen alten Summaries
-        new_summaries.extend(pending_new_summaries)
-
-    # ============ NEU: Fallback für fehlgeschlagene Cluster ============
-    succeeded_cluster_ids = {s['cluster_id'] for s in new_summaries if
-                             s.get('consolidated') and s.get('cluster_id') in {c['cluster_id'] for c in clusters_info}}
-
-    recovered_count = 0
-    for c_info in clusters_info:
-        if c_info['cluster_id'] in succeeded_cluster_ids:
-            continue
-
-        print(
-            f"⚠️  Cluster {c_info['cluster_id']} hatte keinen gültigen LLM-Output → Fallback-Summary statt Datenverlust")
-
-        old_summaries = c_info.get('involved_old_summaries', [])
-        fact_values = c_info.get('involved_fact_values', [])
-
-        if old_summaries:
-            description = ". ".join(s.get('description', '') for s in old_summaries if s.get('description'))
-            merged_insights = []
-            for s in old_summaries:
-                merged_insights.extend(s.get('insights', []))
-        else:
-            description = "; ".join(v for v in fact_values if v) or "Summary (Fallback nach LLM-Fehler)"
-            merged_insights = []
-
-        fallback_summary = {
-            'timestamp': pd.Timestamp.now().isoformat(),
-            'cluster_id': c_info['cluster_id'],
-            'kmeans_label': c_info.get('kmeans_label'),
-            'item_count': c_info.get('size'),
-            'description': description,
-            'response': None,
-            'insights': merged_insights,
-            'embedding': None,
-            'consolidated': True,
-            'fallback': True,
-        }
-        new_summaries.append(fallback_summary)
-        recovered_count += 1
-
-    if recovered_count:
-        print(f"{bot_name}: ♻️  {recovered_count} Cluster über Fallback gerettet (keine Daten verloren)")
-
-    # ── NEU: Vektorisierung der Cluster UND individuellen Insights im Batch ──
-    cluster_texts_to_embed = []
-    cluster_indices = []
-
-    insight_texts_to_embed = []
-    insight_coordinates = []  # Speichert Tupel: (summary_index, insight_index)
-    """
-    # ── NEU: Vektorisierung der Cluster (via Zentroid) UND individuellen Insights im Batch ──
-    insight_texts_to_embed = []
-    insight_coordinates = []  # Speichert Tupel: (summary_index, insight_index)
-
-    for s_idx, summary in enumerate(new_summaries):
-        # 1. Haupt-Cluster-Embedding als mathematischen Durchschnitt (Zentroid) berechnen
-        if summary.get('embedding') is None or not isinstance(summary['embedding'], np.ndarray):
-            c_id = summary.get('cluster_id')
-            if c_id is not None:
-                # Extrahiere alle Vektoren (Fakten/alte Cluster), die diesem Cluster zugeordnet wurden
-                cluster_item_embeddings = X[labels == c_id]
-
-                if len(cluster_item_embeddings) > 0:
-                    # Mathematischer Mittelwert über alle Element-Embeddings im Cluster
-                    centroid = np.mean(cluster_item_embeddings, axis=0)
-
-                    # L2-Normalisierung für korrekte Metrik bei Cosine Similarity
-                    norm = np.linalg.norm(centroid)
-                    if norm > 0:
-                        centroid = centroid / norm
-
-                    summary['embedding'] = centroid
-                else:
-                    summary['embedding'] = None
-
-        # 2. Jedes einzelne Insight im Cluster prüfen und für Batch-Embedding vormerken
-        for i_idx, insight in enumerate(summary.get('insights', [])):
-            if insight.get('embedding') is None:
-                key = insight.get('key', '').strip()
-                value = insight.get('value', '').strip()
-
-                # Formatiere den Text, der semantisch repräsentiert werden soll
-                insight_text = f"{key}: {value}" if key else value
-                if insight_text:
-                    insight_texts_to_embed.append(insight_text)
-                    insight_coordinates.append((s_idx, i_idx))
-
-    # HINWEIS: Die alte Batch-Generierung 'if cluster_texts_to_embed:' wurde komplett entfernt!
-
-    # Batch-Generierung NUR noch für alle einzelnen Extended Insights (falls vorhanden)
-    if insight_texts_to_embed:
-        print(f"🔮 Generiere echte Embeddings für {len(insight_texts_to_embed)} individuelle Extended Insights...")
-        i_vectors = db.embedder.create(insight_texts_to_embed, show_progress_bar=False)
-        for (s_idx, i_idx), vec in zip(insight_coordinates, i_vectors):
-            new_summaries[s_idx]['insights'][i_idx]['embedding'] = vec"""
-
-
-    for s_idx, summary in enumerate(new_summaries):
-        # 1. Haupt-Cluster-Embedding prüfen (falls neu oder unvollständig)
-        if summary.get('embedding') is None or not isinstance(summary['embedding'], np.ndarray):
-            cluster_texts_to_embed.append(summary['description'])
-            cluster_indices.append(s_idx)
-
-        # 2. Jedes einzelne Insight im Cluster prüfen und für Batch-Embedding vormerken
-        for i_idx, insight in enumerate(summary.get('insights', [])):
-            if insight.get('embedding') is None:
-                key = insight.get('key', '').strip()
-                value = insight.get('value', '').strip()
-                inf_type = insight.get('inference_type', insight.get('type', 'info')).strip()
-
-                # Formatiere den Text, der semantisch repräsentiert werden soll
-                #insight_text = f"[{inf_type}] {key}: {value}" if key else value
-                insight_text = f"{key}: {value}" if key else value
-                if insight_text:
-                    insight_texts_to_embed.append(insight_text)
-                    insight_coordinates.append((s_idx, i_idx))
-
-    # Batch-Generierung für Cluster-Vektoren
-    if cluster_texts_to_embed:
-        logger.info(f"🔮 Generiere echte Embeddings für {len(cluster_texts_to_embed)} Cluster-Zusammenfassungen...")
-        #c_vectors = db.embedder.create(cluster_texts_to_embed, show_progress_bar=False)
-        c_vectors = get_shared_embedding(cluster_texts_to_embed, bot_name, embed_req_q, embed_res_q)
-        for s_idx, vec in zip(cluster_indices, c_vectors):
-            new_summaries[s_idx]['embedding'] = vec
-
-    # Batch-Generierung für alle einzelnen Extended Insights
-    if insight_texts_to_embed:
-        logger.info(f"🔮 Generiere echte Embeddings für {len(insight_texts_to_embed)} individuelle Extended Insights...")
-        #i_vectors = db.embedder.create(insight_texts_to_embed, show_progress_bar=False)
-        i_vectors = get_shared_embedding(insight_texts_to_embed, bot_name, embed_req_q, embed_res_q)
-        for (s_idx, i_idx), vec in zip(insight_coordinates, i_vectors):
-            new_summaries[s_idx]['insights'][i_idx]['embedding'] = vec
-
-    # Speicher den aktualisierten Zustand ab
-    unified_memory['cluster_summaries'] = new_summaries
-
-    bot_base_dir = f"bots/{bot_name}"
-    os.makedirs(f"{bot_base_dir}/database", exist_ok=True)
-    unified_file = f"{bot_base_dir}/database/unified_memory.pkl"
-
-    # Der bestehende Speicher-Code folgt hier nativ:
-    with open(unified_file, 'wb') as f:
-        pickle.dump(unified_memory, f)
-
-    # ============ ÄNDERUNG 9: Lösche geclusterte Fakten ============
-    clustered_fact_indices = set([idx for idx in range(num_facts)
-                                  if any(idx in cluster['fact_indices'] and idx < fact_offset
-                                         for cluster in clusters_info)])
-
-    new_facts = []
-    new_metadata = {}
-    for old_idx in range(len(unified_memory['facts'])):
-        if old_idx not in clustered_fact_indices:
-            new_idx = len(new_facts)
-            new_facts.append(unified_memory['facts'][old_idx])
-            if old_idx in unified_memory['metadata']:
-                new_metadata[new_idx] = unified_memory['metadata'][old_idx]
-
-    # ============ ÄNDERUNG 10: Aktualisiere unified_memory ============
-    deleted_facts = len(unified_memory['facts']) - len(new_facts)
-    unified_memory['facts'] = new_facts
-    unified_memory['metadata'] = new_metadata
-    unified_memory['cluster_summaries'] = new_summaries
-
-    if 'cluster_history' not in unified_memory:
-        unified_memory['cluster_history'] = []
-
-    unified_memory['cluster_history'].append({
-        'timestamp': pd.Timestamp.now().isoformat(),
-        'num_clusters': target_clusters,
-        'total_items_clustered': num_items,
-        'new_summaries': len(new_summaries_to_create),
-        'kept_summaries': len(old_summaries_to_keep),
-        'facts_deleted': deleted_facts,
-        'compression_factor': args.compression_factor
-    })
-
-    # ============ ÄNDERUNG 11: Speichere ============
-    with open(unified_file, 'wb') as f:
-        pickle.dump(unified_memory, f)
-
-    print(f"{bot_name}: 🗑️  Deleted {deleted_facts} facts")
-    print(f"{bot_name}: ✅ Created {len(new_summaries_to_create)} new summaries, kept {len(old_summaries_to_keep)} old summaries")
-    print(f"{bot_name}: ✅ Updated unified consolidation: {len(new_facts)} facts + {len(new_summaries)} summaries remaining")
-
-
-    # ============ Analysis before consolidation
-    try:
-        from consolidation.analysis import plot_memory_snapshot
-        plot_memory_snapshot(bot_name = bot_name,
-                             state="after", labels=labels)
-    except Exception as plot_err:
-        print(f"⚠️  Konnte Vor-Consolidation-Snapshot nicht erstellen: {plot_err}")
-
-
-    force_save(bot_name, logger)
-
-
-def force_save(bot_name, logger):
-    """Extrahiere die vollständigen LLM-Responses und speichere sie als Pickle"""
-
-    reasoning_input = f"bots/{bot_name}/database/ours_reasoning.jsonl"
-    os.makedirs(f"bots/{bot_name}/database", exist_ok=True)
-
-    output_dir = f"bots/{bot_name}/database/"
-    os.makedirs(output_dir, exist_ok=True)
-
-    if not os.path.exists(reasoning_input):
-        print(f"❌ Fehler: {reasoning_input} nicht gefunden!")
-        return
-
-    reasoning_units = []
-    total_processed = 0
-    total_failed = 0
-
-    with open(reasoning_input, 'r') as f:
-        for line in f:
-            try:
-                data = json.loads(line)
-                total_processed += 1
-
-                # Die response IST die wichtige Zusammenfassung!
-                response_text = data.get('response', '')
-
-                if not response_text:
-                    total_failed += 1
-                    continue
-
-                # Parse die Response um extended_insight zu extrahieren
-                resp = fix_incomplete_json(response_text)
-
-                if resp and "extended_insight" in resp:
-                    # Speichere die gesamte Response + Metadaten
-                    reasoning_units.append({
-                        "content": response_text,  # ← Die vollständige Response!
-                        "cluster_id": data.get('cluster_id', 0),
-                        "item_count": data.get('item_count', 1),
-                        "insights_count": len(resp.get("extended_insight", [])),
-                        "model": data.get('model', 'unknown'),
-                        "usage_tokens": data.get('usage', {}).get('total_tokens', 0)
-                    })
-                else:
-                    total_failed += 1
-            except Exception as e:
-                total_failed += 1
-                print(f"⚠️  Fehler beim Verarbeiten einer Zeile: {e}")
-
-    if not reasoning_units:
-        print("❌ Keine gültigen Reasoning Units gefunden!")
-        return
-
-    # Erstelle DataFrame und speichere
-    final_df = pd.DataFrame(reasoning_units)
-    output_file = os.path.join(output_dir, "reasoning_units.pkl")
-
-    with open(output_file, 'wb') as f:
-        pickle.dump(final_df, f)
-
-    logger.info(f"✅ ERFOLG: {len(reasoning_units)} Reasoning Units extrahiert!")
-    logger.info(f"   Verarbeitet: {total_processed}, Fehlgeschlagen: {total_failed}")
-    logger.info(f"   Gespeichert in: {output_file}")
-
-    # ============ ÄNDERUNG 1: Zeige Unified Memory Status (mit neuer Struktur) ============
-    bot_base_dir = f"bots/{bot_name}"
-    os.makedirs(f"{bot_base_dir}/database", exist_ok=True)
-    unified_file = f"{bot_base_dir}/database/unified_memory.pkl"
-    if os.path.exists(unified_file):
-        with open(unified_file, 'rb') as f:
-            unified_memory = pickle.load(f)
-        print(f"{bot_name}: \n📊 Unified Memory Status:")
-        print(f"{bot_name}:    - Verbleibende Fakten: {len(unified_memory.get('facts', []))}")
-        print(f"{bot_name}:    - Gespeicherte Cluster-Summaries: {len(unified_memory.get('cluster_summaries', []))}")
-
-        # ============ ÄNDERUNG 2: Zeige Cluster History ============
-        cluster_history = unified_memory.get('cluster_history', [])
-        if cluster_history:
-            print(f"{bot_name}:    - Clustering Runs: {len(cluster_history)}")
-            latest = cluster_history[-1]
-            print(f"{bot_name}:    - Letzter Run: {latest['timestamp']}")
-            print(f"{bot_name}:      • Cluster erstellt: {latest['num_clusters']}")
-            print(f"{bot_name}:      • Items geclustert: {latest['total_items_clustered']}")
-            # Neue oder alte Keys - je nachdem was existiert
-            if 'new_summaries' in latest:
-                print(f"{bot_name}:      • Neue Summaries: {latest['new_summaries']}")
-                print(f"{bot_name}:      • Beibehaltene alte Summaries: {latest.get('kept_summaries', 0)}")
-            elif 'summaries_created' in latest:
-                print(f"{bot_name}:      • Cluster-Summaries erstellt: {latest['summaries_created']}")
-
-    print_memory(bot_name)
-
-
-def print_memory(bot_name):
-
-    bot_base_dir = f"bots/{bot_name}"
-    os.makedirs(f"{bot_base_dir}/database", exist_ok=True)
-    unified_file = f"{bot_base_dir}/database/unified_memory.pkl"
-
-    with open(unified_file, 'rb') as f:
-        unified_memory = pickle.load(f)
-
-    print("\n" + "=" * 80)
-    print(f"{bot_name}: CLUSTER-ZUSAMMENFASSUNGEN (RAG Memory)")
-    print("=" * 80)
-
-    # Alle Cluster-Summaries
-    summaries = unified_memory['cluster_summaries']
-    print(f"Total clusters: {len(summaries)}")
-
-    for i, summary in enumerate(summaries):
-        print(f"\n🔹 Cluster {i}:")
-        print(f"   Items: {summary['item_count']}")
-        print(f"   Created: {summary['timestamp']}")
-        for insight in summary['insights']:
-            print(f"   • [{insight['inference_type'], insight['date']}] {insight['key']}: {insight['value']}")
-
-    print("\n")
-
-
-def start_rag(query_text, observation, bot_name, embed_req_q, embed_res_q):
-
-    bot_base_dir = f"bots/{bot_name}"
-    unified_memory_path=f"{bot_base_dir}/database/unified_memory.pkl"
-    k = 10
-
-    """
-    Sucht hocheffizient in den vorausberechneten Vektoren einzelner Insights.
-    Verhindert das datenbankseitige Neuerstellen von Embeddings zur Abfragezeit.
-    """
-    import os
-    import pickle
-    import numpy as np
-
-    if not os.path.exists(unified_memory_path):
-        print(f"⚠️ {unified_memory_path} nicht gefunden! Nutzen Sie Fallback.")
-        return []
-
-    with open(unified_memory_path, 'rb') as f:
-        unified_memory = pickle.load(f)
-
-    cluster_summaries = unified_memory.get('cluster_summaries', [])
-
-    flat_insights = []
-    vectors = []
-
-    # 1. Sammle alle flachen Insights, die bereits einen Vektor besitzen
-    for summary in cluster_summaries:
-        cluster_timestamp = summary.get('timestamp', 'unknown')
-        for insight in summary.get('insights', []):
-            if 'embedding' in insight and insight['embedding'] is not None:
-                key = insight.get('key', '').strip()
-                value = insight.get('value', '').strip()
-                inf_type = insight.get('inference_type', insight.get('type', 'info')).strip()
-                #insight_date = insight.get('date', cluster_timestamp)
-
-                insight_date = format_relative_time(insight.get('date', 'N/A').strip(), observation)
-
-                formatted_text = f"[{insight_date}] {key}: {value}"
-
-                flat_insights.append({
-                    'text': formatted_text,
-                })
-                vectors.append(insight['embedding'])
-
-    if not vectors:
-        print("⚠️ Keine vorausberechneten Insight-Vektoren in der Memory-Datei gefunden.")
-        return []
-
-    # 2. Generiere NUR das Query-Embedding (1 einzige API-Anfrage)
-    #query_vector = db.embedder.create([query_text], show_progress_bar=False)[0]
-    raw_query_vector = get_shared_embedding([query_text], bot_name, embed_req_q, embed_res_q)
-    query_vector = np.array(raw_query_vector).flatten()
-
-    # 3. Berechne Vektorisierte Kosinus-Ähnlichkeit blitzschnell via NumPy
-    X_insights = np.array(vectors)
-
-    # Normalisierungen für die exakte Cosine-Similarity
-    X_norm = X_insights / np.linalg.norm(X_insights, axis=1, keepdims=True)
-    q_norm = query_vector / np.linalg.norm(query_vector)
-
-    # Matrix-Multiplikation liefert alle Scores gleichzeitig
-    scores = X_norm @ q_norm
-
-    # Top-K Indizes sortieren (absteigend)
-    top_k_indices = np.argsort(scores)[::-1][:k]
-
-    # 4. Ergebnisse kompilieren & für Prompt formatieren
-    results_strings = []
-
-    for idx in top_k_indices:
-        score = float(scores[idx])
-
-        # Eine sinnvolle Schwelle für die Kosinus-Ähnlichkeit (z.B. 0.15 oder 0.2)
-        # verhindert, dass völlig unpassende Fakten den Kontext überladen
-        if score > 0.15:
-            entry = flat_insights[idx]
-            text_content = entry['text']
-
-            # Formatiere jeden Fakt als sauberen Listenpunkt inklusive zeitlichem Kontext
-            results_strings.append(f"- {text_content}")
-
-    # Verbinde die Listenpunkte mit Zeilenumbrüchen.
-    # Falls keine Treffer über der Schwelle lagen, geben wir einen leeren Fallback an.
-    feedback_block = "\n".join(
-        results_strings) if results_strings else "- No relevant insights available for this context."
-
-    # Jetzt kannst du den fertigen String sauber injizieren
-    enhanced_prompt = (
-        f"### Abstract ideas as feedback:\n"
-        f"{feedback_block}\n"
-    )
-
-    return enhanced_prompt
-
-
+# =====================================================================
+# AUXILIARY UTILS
+# =====================================================================
 def format_relative_time(date_str, observation):
-    """
-    Converts a timestamp or time range into a relative natural language description.
-    Handles formats like:
-    - "2026-01-07 Wednesday 16:58:43"
-    - "2026-01-07 Wednesday 15:13:49 to 2026-01-07 Wednesday 16:49:41"
-    """
     try:
-        # Reference time for calculation
-        now = observation.get("time", "")
-
         raw_now = observation.get("time", "").replace("   - Current Time: ", "").strip()
 
         def parse_dt(s):
             s = s.strip()
-            formats = [
-                "%Y-%m-%d %A %H:%M:%S",
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%d %A %H:%M",
-                "%Y-%m-%d"
-            ]
+            formats = ["%Y-%m-%d %A %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %A %H:%M", "%Y-%m-%d"]
             for fmt in formats:
                 try:
                     return datetime.strptime(s, fmt)
@@ -1057,26 +424,21 @@ def format_relative_time(date_str, observation):
             return datetime.fromisoformat(s.split(' ')[0])
 
         now = parse_dt(raw_now)
-
         duration_str = ""
         if " to " in date_str:
             start_str, end_str = date_str.split(" to ")
             dt_start = parse_dt(start_str)
             dt_end = parse_dt(end_str)
-
-            # Calculate duration
             duration = dt_end - dt_start
             d_hours = duration.seconds // 3600
             d_mins = (duration.seconds % 3600) // 60
-
             if duration.days > 0:
                 duration_str = f" for {duration.days} days"
             elif d_hours > 0:
                 duration_str = f" for {d_hours} hours"
             elif d_mins > 0:
                 duration_str = f" for {d_mins} minutes"
-
-            dt = dt_start  # Use start time for relative calculation
+            dt = dt_start
         else:
             dt = parse_dt(date_str)
 
@@ -1085,13 +447,11 @@ def format_relative_time(date_str, observation):
         seconds = diff.seconds
         hours = seconds // 3600
         minutes = (seconds % 3600) // 60
-
         time_str = dt.strftime("%H:%M:%S")
 
         if days == 0:
             if hours == 0:
-                if minutes == 0:
-                    return f"Just now{duration_str} at {time_str}"
+                if minutes == 0: return f"Just now{duration_str} at {time_str}"
                 return f"{minutes} minutes ago{duration_str} at {time_str}"
             return f"Today, {hours} hours ago{duration_str} at {time_str}"
         elif days == 1:
@@ -1099,20 +459,295 @@ def format_relative_time(date_str, observation):
         elif days < 7:
             return f"{days} days ago{duration_str} at {time_str}"
         else:
-            weeks = days // 7
-            return f"{weeks} weeks ago{duration_str} at {time_str}"
-
+            return f"{days // 7} weeks ago{duration_str} at {time_str}"
     except Exception:
         return date_str
 
 
-def get_shared_embedding(text, bot_name, req_queue, res_queue):
-    """
-    Fragt den zentralen GPU-Worker nach dem Embedding für einen Text.
-    """
-    # Anfrage abschicken
-    req_queue.put((bot_name, text))
+def print_memory_json(bot_name):
+    unified_file = f"bots/{bot_name}/database/unified_memory.json"
+    if not os.path.exists(unified_file):
+        return
+    with open(unified_file, 'r', encoding='utf-8') as f:
+        unified_memory = json.load(f)
 
-    # Auf Antwort warten (blockiert nur diesen einen Bot-Prozess, nicht die GPU)
-    vector = res_queue.get()
-    return vector
+    print("\n" + "=" * 80)
+    print(f"{bot_name}: CLUSTER-ZUSAMMENFASSUNGEN (JSON RAG Memory)")
+    print("=" * 80)
+    summaries = unified_memory.get('cluster_summaries', [])
+    for i, summary in enumerate(summaries):
+        print(f"\n🔹 Cluster {i}: {summary.get('description')}")
+        for insight in summary.get('insights', []):
+            print(f"   • [{insight.get('inference_type')}] {insight.get('key')}: {insight.get('value')}")
+    print("\n")
+
+
+import yaml
+
+
+# =====================================================================
+# NATIVE REASON_INFO.YAML COMPLETION HELPER
+# =====================================================================
+def run_llm_reasoning_info(fragments_text: str, bot_name: str, yaml_path: str = "consolidation/reason_info.yaml") -> list:
+    """
+    Lädt die Prompt-Konfiguration aus der YAML-Datei, ersetzt das Fragment-Placeholder
+    und holt die strukturierten Insights über OpenRouter ein.
+    """
+    if not os.path.exists(yaml_path):
+        print(f"❌ Prompt-Datei nicht gefunden unter: {yaml_path}")
+        return []
+
+    # 1. YAML-Datei dynamisch einlesen
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+    except Exception as e:
+        print(f"❌ Fehler beim Laden der YAML-Datei: {e}")
+        return []
+
+    # 2. Prompt-Inhalt extrahieren und Platzhalter ersetzen
+    base_prompt = config["messages"][0]["content"]
+    full_prompt = base_prompt.replace("{{$memory_fragments}}", fragments_text)
+
+    # OpenRouter API Setup
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    # Statt hart codiertem Key:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY ist nicht in den Umgebungsvariablen gesetzt!")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-Title": f"{bot_name} Reason-Info Ingestion"
+    }
+
+    # Payload dynamisch aus den YAML-Parametern speisen
+    payload = {
+        "model": "openai/gpt-4o-mini",  # Oder dein bevorzugtes Modell
+        "messages": [{"role": "user", "content": full_prompt}],
+        "temperature": config.get("temperature", 0.0),
+        "max_tokens": config.get("max_tokens", 1024)
+    }
+
+    try:
+        # Timeout ebenfalls dynamisch aus der YAML ziehen
+        response = requests.post(url, json=payload, headers=headers, timeout=config.get("timeout", 45))
+        if response.status_code == 200:
+            content = response.json()["choices"][0]["message"]["content"].strip()
+
+            # Nutze deine bestehende Funktion zur JSON-Reparatur
+            parsed_json = fix_incomplete_json(content)
+            return parsed_json
+        else:
+            print(f"❌ OpenRouter Ingestion Fehler ({response.status_code}): {response.text}")
+            return []
+    except Exception as e:
+        print(f"❌ Netzwerkfehler beim Fact-Reasoning: {e}")
+        return []
+
+
+def sync_memory_to_neo4j(unified_memory, database, uri="bolt://localhost:7687", auth=("neo4j", "eher2015")):
+    driver = GraphDatabase.driver(uri, auth=auth)
+    cluster_mapping = {}
+
+    facts_payload = []
+    current_hashes = []
+
+    # Da Summaries nun auch in 'facts' liegen, verarbeiten wir alles in einem Rutsch
+    for fact in unified_memory.get('facts', []):
+        f_hash = get_fact_hash(fact)
+        current_hashes.append(f_hash)
+
+        facts_payload.append({
+            "hash": f_hash,
+            "session_id": fact.get("session_id", ""),
+            "date": fact.get("date", ""),
+            "query": fact.get("query", ""),
+            "description": fact.get("description", ""),
+            "summary": fact.get("description", ""),  # Für Abwärtskompatibilität in Explore
+            "type": fact.get("type", "fact"),
+            "cluster_id": fact.get("cluster_id", -1),
+            # 🚀 FIX 1: extended_insight_json muss als String in die Payload, da Neo4j es im SET aufruft!
+            "extended_insight_json": json.dumps(fact.get("extended_insight", []), ensure_ascii=False)
+        })
+
+    edges_payload = []
+    matrix = unified_memory.get('similarity_matrix', {})
+    for source_hash, targets in matrix.items():
+        for target_hash, score in targets.items():
+            if source_hash == target_hash:
+                continue
+            if source_hash in current_hashes and target_hash in current_hashes:
+                if score >= 0.05:
+                    edges_payload.append({
+                        "source": source_hash,
+                        "target": target_hash,
+                        "score": float(score)
+                    })
+
+    try:
+        with driver.session(database=database) as session:
+            session.run("CREATE CONSTRAINT fact_hash_idx IF NOT EXISTS FOR (f:Fact) REQUIRE f.hash IS UNIQUE")
+
+            # Pruning: Löscht veraltete Fakten und veraltete Cluster-Summaries (da deren Hashes sich geändert haben)
+            cleanup_nodes_query = "MATCH (f:Fact) WHERE NOT f.hash IN $current_hashes DETACH DELETE f"
+            session.run(cleanup_nodes_query, current_hashes=current_hashes)
+            session.run("MATCH (:Fact)-[r:SIMILAR_TO]->(:Fact) DELETE r")
+
+            # Nodes einheitlich schreiben
+            if facts_payload:
+                # 🚀 FIX 2: f.query und f.description im SET hinzugefügt!
+                fact_query = """
+                            UNWIND $facts AS fact_data
+                            MERGE (f:Fact {hash: fact_data.hash})
+                            SET f.session_id = fact_data.session_id,
+                                f.date = fact_data.date,
+                                f.query = fact_data.query,
+                                f.description = fact_data.description,
+                                f.extended_insight_json = fact_data.extended_insight_json,
+                                f.summary = fact_data.summary,
+                                f.type = fact_data.type,
+                                f.cluster_id = fact_data.cluster_id
+                            """
+                session.run(fact_query, facts=facts_payload)
+
+            # Kanten schreiben (Verknüpft gleichermaßen fact->fact, fact->summary und summary->summary)
+            if edges_payload:
+                edge_query = """
+                UNWIND $edges AS edge_data
+                MATCH (source:Fact {hash: edge_data.source})
+                MATCH (target:Fact {hash: edge_data.target})
+                MERGE (source)-[r:SIMILAR_TO]->(target)
+                SET r.score = edge_data.score
+                """
+                session.run(edge_query, edges=edges_payload)
+
+                print("🧠 Führe Louvain-Clustering nativ in Neo4j aus...")
+                session.run("CALL gds.graph.drop('memoryGraph', false)")
+                # Das GDS-Projekt lädt nun alle :Fact Knoten (Fakten + Summaries) und deren SIMILAR_TO Beziehungen!
+                session.run(
+                    "CALL gds.graph.project('memoryGraph', 'Fact', { SIMILAR_TO: { orientation: 'UNDIRECTED', properties: 'score' } })"
+                )
+                session.run(
+                    "CALL gds.louvain.write('memoryGraph', { writeProperty: 'cluster_id', relationshipWeightProperty: 'score', maxLevels: 1 })")
+                session.run(
+                    "CALL gds.fastRP.write('memoryGraph', { relationshipWeightProperty: 'score', embeddingDimension: 128, iterationWeights: [0.0, 1.0, 0.7], writeProperty: 'structure_embedding' })")
+                session.run("CALL gds.graph.drop('memoryGraph')")
+
+                print("📥 Synchronisiere neue topologische Cluster-Zuordnungen zurück...")
+                result = session.run("MATCH (f:Fact) RETURN f.hash AS hash, f.cluster_id AS cluster_id")
+                cluster_mapping = {record["hash"]: record["cluster_id"] for record in result}
+
+            # Topologische Shifts der Cluster bestimmen
+            unified_memory = compute_topological_cluster_embeddings(session, unified_memory)
+
+    finally:
+        driver.close()
+
+    # Lokale IDs für konsistente Rückgabe spiegeln
+    for fact in unified_memory.get('facts', []):
+        f_hash = get_fact_hash(fact)
+        fact['cluster_id'] = cluster_mapping.get(f_hash, -1)
+
+    return unified_memory
+
+
+def compute_topological_cluster_embeddings(session, unified_memory, shift_threshold=2.2):
+    """
+    Fragt FastRP-Embeddings ab, berechnet den topologischen Zentroiden pro Cluster
+    und vergleicht ihn mit dem Vorzustand. Nutzt den Overlap von Fakten-Hashes für ein
+    stabiles Tracking über dynamische Louvain-Re-Runs hinweg.
+    """
+    # 1. Struktur-Embeddings und Cluster-IDs aus Neo4j abfragen
+    result = session.run("""
+        MATCH (f:Fact) 
+        WHERE f.structure_embedding IS NOT NULL AND f.cluster_id IS NOT NULL
+        RETURN f.hash AS hash, f.cluster_id AS cluster_id, f.structure_embedding AS embedding
+    """)
+
+    # Daten nach Cluster gruppieren und Hashes sammeln
+    cluster_vectors = {}
+    cluster_hashes = {}
+    for record in result:
+        c_id = record['cluster_id']
+        emb = record['embedding']  # Liste von Floats aus Neo4j (FastRP-Vektor)
+        f_hash = record['hash']
+
+        if c_id not in cluster_vectors:
+            cluster_vectors[c_id] = []
+            cluster_hashes[c_id] = []
+        cluster_vectors[c_id].append(emb)
+        cluster_hashes[c_id].append(f_hash)
+
+    # Lokale alte Summaries als Pool für das Hash-Matching holen
+    old_summaries = unified_memory.get('cluster_summaries', [])
+    new_summaries = []
+
+    # 2. Jedes von Louvain gefundene Cluster analysieren
+    for c_id, vectors in cluster_vectors.items():
+        current_hashes = cluster_hashes[c_id]
+        current_hashes_set = set(current_hashes)
+
+        # Mathematischer Mittelwert (Zentroid) über alle FastRP-Vektoren des Clusters
+        vectors_np = np.array(vectors)
+        new_centroid = np.mean(vectors_np, axis=0).tolist()
+
+        # 🎯 STABILES MATCHING: Finde das alte Cluster mit dem größten Fakten-Overlap
+        best_old_summary = None
+        max_overlap = 0
+
+        for old_s in old_summaries:
+            old_hashes_set = set(old_s.get('associated_hashes', []))
+            overlap = len(current_hashes_set.intersection(old_hashes_set))
+            if overlap > max_overlap:
+                max_overlap = overlap
+                best_old_summary = old_s
+
+        # Wenn ein valides Match existiert (mindestens 1 überlappender Fakt)
+        if best_old_summary and max_overlap > 0:
+            # 🔄 CLUSTER EXISTIERT BEREITS -> Auf topologischen Shift prüfen
+            old_centroid = best_old_summary.get("topological_embedding")
+
+            if old_centroid and len(old_centroid) == len(new_centroid):
+                # Euklidische Distanz zwischen altem und neuem Schwerpunkt berechnen
+                distance = float(np.linalg.norm(np.array(old_centroid) - np.array(new_centroid)))
+
+                if distance > shift_threshold:
+                    print(
+                        f"🔄 Cluster {c_id} (ehemals {best_old_summary.get('cluster_id')}) hat sich verschoben (Shift: {distance:.4f} > {shift_threshold}). Markiere für LLM.")
+                    best_old_summary["needs_consolidation"] = True
+                # HINWEIS: Falls das LLM es in diesem Durchlauf frisch auf False gesetzt hat,
+                # bleibt es False, es sei denn, der topologische Shift war zu radikal.
+            else:
+                best_old_summary["needs_consolidation"] = True
+
+            # Metadaten auf die neue Louvain-Realität aktualisieren
+            best_old_summary["cluster_id"] = c_id
+            best_old_summary["topological_embedding"] = new_centroid
+            best_old_summary["associated_hashes"] = current_hashes
+            best_old_summary["description"] = f"Neo4j Cluster {c_id} ({len(current_hashes)} Fakten)"
+
+            # Synchronisation für print_memory_json (Spiegelung der Keys)
+            if "extended_insight" in best_old_summary and not best_old_summary.get("insights"):
+                best_old_summary["insights"] = best_old_summary["extended_insight"]
+
+            new_summaries.append(best_old_summary)
+
+        else:
+            # ✨ KOMPLETT NEUES CLUSTER ENTSTANDEN -> Sofort vormerken
+            print(f"✨ Neues Cluster {c_id} via FastRP/Louvain entdeckt. Markiere für LLM.")
+            new_summary = {
+                "cluster_id": c_id,
+                "description": f"Neo4j Cluster {c_id} ({len(current_hashes)} Fakten)",
+                "associated_hashes": current_hashes,
+                "insights": [],
+                "extended_insight": [],
+                "topological_embedding": new_centroid,
+                "needs_consolidation": True  # 🎯 Vormerken fürs LLM!
+            }
+            new_summaries.append(new_summary)
+
+    # Speicher aktualisieren
+    unified_memory['cluster_summaries'] = new_summaries
+    return unified_memory
