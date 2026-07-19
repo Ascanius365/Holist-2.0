@@ -15,9 +15,10 @@ import logging
 
 from Loader import write_log
 from RAG import generate_rag_query
-from consolidation.run_reasoning import run_memory_pipeline
+#from consolidation.run_reasoning import run_memory_pipeline
 from Amygdala import Amygdala
 import base64
+from consolidation.memory_test import HierarchicalVectorMemory, run_memory_pipeline
 
 
 db_instance = None
@@ -65,6 +66,11 @@ class MinecraftAction(BaseModel):
                         "(e.g., 'Where is the melon field?', 'How did I build the automated furnace?')."
     )
 
+    chat_intent: Optional[str] = Field(
+        None,
+        description="A chat message displayed in the world chat."
+    )
+
 
 class SimpleMemory:
     """A consolidation system with AI-based summarization."""
@@ -72,6 +78,7 @@ class SimpleMemory:
     def __init__(self, bot_name, logger, max_messages: int = 5, summarizer_llm=None):
         self.action_data = ""
         self.search_intent = ""
+        self.chat_intent = ""
         self.max_messages = max_messages
         self.summary = ""
         self.bot_name = bot_name
@@ -108,7 +115,8 @@ class SimpleMemory:
     def summarize_old_messages(self, observation_time, observation, logger):
         """Adds an input-output pair to consolidation."""
 
-        self.summary = f"Last action: {self.action_data} \n Last search intent: {self.search_intent} \n Last feedback: {observation.get("Tool feedback", "")}"
+        self.summary = (f"Last action: {self.action_data} \n Last search intent: {self.search_intent} \n"
+                        f" Last feedback: {observation.get("Tool feedback", "")} \n Last message: {self.chat_intent}")
 
         logger.info(f"✅ Memory: {self.summary[:500]}...")
 
@@ -204,6 +212,8 @@ def agent_worker_process(req_q, res_q, log_path, bot_name, embed_req_q, embed_re
     # The Memory-Objekt
     memory = SimpleMemory(logger=logger, bot_name=bot_name, max_messages=5)
 
+    mem = HierarchicalVectorMemory(bot_name)
+
     args = parse_arguments()
 
     client = OpenAI(
@@ -291,6 +301,9 @@ def agent_worker_process(req_q, res_q, log_path, bot_name, embed_req_q, embed_re
                 rag_query = generate_rag_query(observation, memory.summary)  # Generate Query
                 logger.info("rag_query: " + rag_query)
 
+                rag_context = asyncio.run(run_memory_pipeline(bot_name, logger, mem, rag_query))
+
+                """
                 rag_context = run_memory_pipeline(
                     args=args,
                     bot_name=bot_name,
@@ -299,7 +312,7 @@ def agent_worker_process(req_q, res_q, log_path, bot_name, embed_req_q, embed_re
                     embed_req_q=None,
                     embed_res_q=None,
                     logger=logger
-                )
+                )"""
 
             # EXTEND SYSTEM PROMPT WITH RAG
             system_prompt_with_rag = system_prompt
@@ -352,11 +365,13 @@ def agent_worker_process(req_q, res_q, log_path, bot_name, embed_req_q, embed_re
                 print(f"📝 Reasoning: {action_data.reasoning[:500]}...")
                 print(f"🔢 Count: {action_data.count}")
                 print(f"Question: {action_data.search_intent}")
+                print(f"Message: {action_data.chat_intent}")
 
                 #amy.analyze_situation(data, observation)
 
-                memory.action_data = action_data.reasoning[:500]
+                memory.action_data = action_data.reasoning[:500] if action_data.reasoning else ""
                 memory.search_intent = action_data.search_intent[:500] if action_data.search_intent else ""
+                memory.chat_intent = action_data.chat_intent [:500] if action_data.chat_intent else ""
 
                 # Daten in die Antwort-Queue legen
                 res_q.put(data)

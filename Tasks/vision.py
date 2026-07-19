@@ -6,6 +6,7 @@ import os
 import re
 import time
 from typing import Dict, Any
+from pathlib import Path
 
 from PIL import Image
 from openai import OpenAI
@@ -90,6 +91,8 @@ class VisionManager:
 
     async def get_birdseye_screenshot(self, bot, observation, output_path="birdseye_view.png"):
 
+        print("Make foto")
+
         output_path = f"bots/{self.bot_name}/birdseye_view.png"
         """
         Macht einen Draufsicht-Screenshot des Viewers.
@@ -159,7 +162,7 @@ class VisionManager:
                 await page.screenshot(path=output_path)
 
                 with Image.open(output_path) as img:
-                    img.thumbnail((512, 512))
+                    img.thumbnail((1024, 1024))
                     img.save(output_path)
 
                     buffered = io.BytesIO()
@@ -183,9 +186,15 @@ class VisionManager:
 
         # --- TEIL 2: VISION-ANALYSE UND SPATIAL FACTS EXTRACTION ---
         try:
+
+            from dotenv import load_dotenv
+            env_path = Path(__file__).parent / '.env'
+            success = load_dotenv(dotenv_path=env_path)
+
             client = OpenAI(
                 base_url="https://openrouter.ai/api/v1",
-                api_key=os.environ.get("OPENAI_API_KEY"),
+                #api_key=os.environ.get("OPENAI_API_KEY"),
+                api_key=os.getenv("OPENROUTER_API_KEY")
             )
 
             system_prompt = (
@@ -252,13 +261,20 @@ class VisionManager:
                 "response": formatted_facts  # ← Enthält jetzt die Liste einzelner Fakten!
             }
 
-            # Stelle sicher dass Verzeichnis existiert
-            os.makedirs(os.path.dirname(self.sessions_file), exist_ok=True)
+            names = ["Caleb", "Dylan", "Kelly"]
 
-            with open(self.sessions_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(sessions_entry, ensure_ascii=False) + "\n")
+            for name in names:
 
-            print(chalk.green(f"{self.bot_name}: ✅ Spatial facts saved in {self.sessions_file}"))
+                bot_dir = f"bots/{name}/memory"
+                sessions_file = f"{bot_dir}/sessions.jsonl"
+
+                # Stelle sicher dass Verzeichnis existiert
+                os.makedirs(os.path.dirname(sessions_file), exist_ok=True)
+
+                with open(sessions_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(sessions_entry, ensure_ascii=False) + "\n")
+
+                print(chalk.green(f"{name}: ✅ Spatial facts saved in {sessions_file}"))
 
         except Exception as api_e:
             print(f"❌ API failure: {api_e}")

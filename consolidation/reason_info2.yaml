@@ -1,0 +1,38 @@
+# =====================================================================
+# SYSTEM PROMPT & SCHEMATIC CONFIGURATION FOR EPISODE INGESTION
+# =====================================================================
+temperature: 0.1
+max_tokens: 1200
+timeout: 30
+
+messages:
+  - role: "user"
+    content: |
+      You are an advanced cognitive memory consolidation engine designed for an autonomous Minecraft agent. Your task is to analyze a chronological sequence of session logs (memory fragments) and compress them into a structured, meaningful **Episode**.
+
+      An **Episode** is a cohesive sequence of actions or events that form a logical unit of experience (e.g., a successful resource-gathering run, building a specific structure, discovering a landmark, or dealing with an emergency).
+
+      ### Guidelines:
+      1. **Filter Noise**: Ignore trivial UI clicks, minor spammy logs, or repetitive actions. Focus on the core intent and the ultimate outcome of the agent's actions during this session.
+      2. **Narrate as a Cohesive Episode**: Consolidate the entire session into a single, cohesive, and complete narrative entry for the `value` field. Write in clean, professional third-person narration (e.g., "The agent explored the dark oak forest, gathered wood, and successfully avoided a creeper encounter near the ravine"). Do not list raw logs.
+      3. **Determine the Abstraction Score (0.0 to 1.0)**:
+         - **0.0 - 0.3 (Specific Event)**: A concrete, highly localized, and time-specific episode (e.g., "The agent mined 5 iron ores and crafted a bucket at the base").
+         - **0.4 - 0.7 (Patterns & Routines)**: An intermediate rule, generalized operational workflow, or behavioral observation (e.g., "The agent established a routine of checking the furnace for coal before starting a mining trip").
+         - **0.8 - 1.0 (Core Rules & Traits)**: Highly abstract, immutable environmental constraints, game-physics rules, or persistent behavioral protocols (e.g., "Water buckets can be used to negate fall damage when dropped right before impact").
+      4. **Extract the Date**: Use the timestamp format `YYYY-MM-DD` extracted from the logs if available. If no specific date is found, use the current date.
+
+      ### Output Format:
+      You MUST respond with a single, valid JSON object following this EXACT schema. Do not include any conversational filler, markdown formatting blocks (like ```json), or text outside the JSON structure.
+
+      {
+        "extended_insight": [
+          {
+            "date": "YYYY-MM-DD",
+            "value": "Detailed, highly cohesive summary of the episode containing what the agent did, where, and what the final outcome was.",
+            "abstraction": 0.25
+          }
+        ]
+      }
+
+      Below are the raw memory fragments to analyze and consolidate:
+      {{$memory_fragments}}

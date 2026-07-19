@@ -18,7 +18,6 @@ from Tasks.observation import observe, scan_blocks
 from Tasks.vision import VisionManager
 from Tasks.farming_skill import doFarming
 from Tasks.pvp import attackMob
-from consolidation.EmbeddingService import central_embedding_worker
 
 
 # Import the javascript libraries
@@ -121,11 +120,11 @@ class MCBot:
 
 
     async def run_vision_background(self, observation):
-        """Dieser Teil läuft parallel, ohne den main_agent_loop zu stoppen"""
+        """Läuft parallel, nutzt aber die bereits gesammelten Observations"""
         try:
-            observation = observe(self.bot, self.mcData, self.chat_history_buffer, self.chat_history,
-                                  self.event_history)
-            asyncio.create_task(self.vision.get_birdseye_screenshot(self.bot, observation))
+            # Reiche die bestehende observation direkt an die Vision weiter,
+            # anstatt die JS-Bridge erneut parallel mit observe() zu belasten!
+            await self.vision.get_birdseye_screenshot(self.bot, observation)
         except Exception as e:
             print(f"⚠️ [Background] Vision Task failed: {e}")
 
@@ -138,11 +137,15 @@ class MCBot:
                 observation = observe(self.bot, self.mcData, self.chat_history_buffer, self.chat_history, self.event_history)
 
                 """
-                # Vision-Check (alle 5 Min)
-                current_time = time.time()
-                if current_time - self.last_vision_update >= 600:
-                    asyncio.create_task(self.run_vision_background(observation))
-                    self.last_vision_update = current_time"""
+                await self.vision.get_birdseye_screenshot(self.bot, observation)
+                # Vision-Check (alle 10 Min / 600 Sek)
+                if self.bot_name == "Dylan":
+                    current_time = time.time()
+                    if current_time - self.last_vision_update >= 600:
+                        print("📸 Trigger Vision Snapshot...")
+                        # Wir übergeben die frische Observation direkt
+                        asyncio.create_task(self.run_vision_background(observation))
+                        self.last_vision_update = current_time"""
 
 
                 # Send to YOUR OWN queue
@@ -163,6 +166,14 @@ class MCBot:
                     x = response.get("x")
                     y = response.get("y")
                     z = response.get("z")
+
+                    try:
+                        chat = response.get("chat_intent")
+                        if chat:
+                            self.bot.chat(chat)
+                    except Exception as e:
+                        traceback.print_exc()
+                        print(f"⚠️ Chat-Fehler (Schleife läuft weiter): {e}")
 
                     if action == "chat":
                         self.bot.chat(reason)
@@ -295,7 +306,7 @@ if __name__ == '__main__':
 
     # Liste deiner simulierten Dorfbewohner
     villagers = ["Caleb", "Dylan", "Kelly"]
-    #villagers =["Kelly"]
+    #villagers =["Dylan"]
 
     bots = []
     base_port = 3001
@@ -307,12 +318,13 @@ if __name__ == '__main__':
 
     embedding_res_queues = {name: ctx.Queue() for name in villagers}
 
+    """
     # 3. Den zentralen GPU-Worker starten
     embedding_process = ctx.Process(
         target=central_embedding_worker,
         args=(embedding_req_queue, embedding_res_queues)
     )
-    embedding_process.start()
+    embedding_process.start()"""
 
     print(f"🏘️ Simuliere Dorfleben mit {len(villagers)} Einwohnern...")
 

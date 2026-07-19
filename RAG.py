@@ -5,8 +5,6 @@ import pickle
 import time
 from datetime import datetime
 
-from consolidation.db import EmbeddingDB
-
 
 def generate_rag_query(observation, history_text):
     """

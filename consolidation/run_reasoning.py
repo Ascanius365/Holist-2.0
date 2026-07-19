@@ -11,9 +11,13 @@ import pandas as pd
 from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import math
+from collections import defaultdict, deque
+from neo4j import GraphDatabase
 
 from neo4j import GraphDatabase
 import numpy as np
+from simple_chalk import chalk
 
 warnings.filterwarnings("ignore")
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
@@ -378,33 +382,147 @@ def run_memory_pipeline(args, bot_name, query_text, observation, embed_req_q, em
                 f.writelines([])  # Verarbeitete Zeilen leeren
 
         # =====================================================================
-        # 4. RETRIEVAL / FEEDBACK FÜR RAG (Top 10 ähnlichste Elemente)
+        # 4. POWER GRID RETRIEVAL & HIERARCHISCHE AUSWERTUNG
         # =====================================================================
-        # Sortiere alle gemessenen Matches global nach Relevanz-Score absteigend
-        all_top_matches.sort(key=lambda x: x[0], reverse=True)
+        driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "eher2015"))
 
+        # Schritt A: Das globale, kreisfreie Stromnetzwerk berechnen
+        grid_trajectories = precompute_cluster_power_grid(driver, db_name, limit=50)
+
+        # Schritt B: Reranker-Ergebnisse sortieren und Einspeisepunkte (Kraftwerke) isolieren
+        all_top_matches.sort(key=lambda x: x[0], reverse=True)
         seen_hashes = set()
-        unique_top_matches = []
+        top_clusters = []  # Speichert Tupel aus (Score, Cluster-Fakt-Objekt)
+        unique_top_facts = []
 
         for score, fact in all_top_matches:
             f_hash = get_fact_hash(fact)
-            # Nur aufnehmen, wenn der Fakt überlebt hat und noch nicht in den Top-Matches ist (Deduplizierung)
-            if f_hash not in seen_hashes and f_hash not in all_deleted_hashes:
-                seen_hashes.add(f_hash)
-                unique_top_matches.append((score, fact))
-                if len(unique_top_matches) >= 10:
-                    break
+            if f_hash in seen_hashes or f_hash in all_deleted_hashes:
+                continue
+            seen_hashes.add(f_hash)
 
+            if fact.get('type') == 'cluster_summary' and score > 0.5:
+                top_clusters.append((score, fact))
+
+            if fact.get('type') == 'fact' and len(unique_top_facts) < 2:
+                unique_top_facts.append((score, fact))
+
+        # ---------------------------------------------------------------------
+        # NEUER ANSATZ: Aufbau eines ATOMAREN Graphen aus den Pfadsegmenten
+        # ---------------------------------------------------------------------
+        from collections import defaultdict, deque
+
+        atomic_graph = defaultdict(list)
+        node_lookup = {}  # Speichert die echten Knoten-Objekte anhand ihres Hashes
+
+        for edge in grid_trajectories:
+            path_nodes = list(edge["path"].nodes)
+
+            # Wir registrieren alle Knoten im Lookup-Table
+            for node in path_nodes:
+                n_hash = get_fact_hash(node)
+                node_lookup[n_hash] = node
+
+            # Wir zerlegen den Pfad in seine atomaren 1-Hop-Segmente
+            for i in range(len(path_nodes) - 1):
+                u = path_nodes[i]
+                v = path_nodes[i + 1]
+                u_hash = get_fact_hash(u)
+                v_hash = get_fact_hash(v)
+
+                # Bidirektionales Hinzufügen der echten Nachbarschaft
+                if v_hash not in atomic_graph[u_hash]:
+                    atomic_graph[u_hash].append(v_hash)
+                if u_hash not in atomic_graph[v_hash]:
+                    atomic_graph[v_hash].append(u_hash)
+
+        # Schritt C: Hierarchisches Ausschwärmen auf dem ATOMAREN Graphen (Radius 1-2)
+        filtered_clusters = [c for c in top_clusters if c[0] >= 0.5]
+        if not filtered_clusters and top_clusters:
+            top_clusters.sort(key=lambda x: x[0], reverse=True)
+            filtered_clusters = [top_clusters[0]]
+
+        trajectories_feedback_lines = []
+
+        for c_score, c_fact in filtered_clusters:
+            c_hash = get_fact_hash(c_fact)
+            c_desc = c_fact.get('description', 'Keine Beschreibung verfügbar')
+
+            cluster_block = f"\n🔹 [Cluster-Summary | Reranker-Score: {c_score:.4f}]: {c_desc}\n"
+            local_unique_nodes = {}
+
+            # Fallback: Falls der exakte Hash nicht im Graphen ist, suchen wir nach einer ID- oder Textübereinstimmung
+            start_hash = None
+            if c_hash in atomic_graph:
+                start_hash = c_hash
+            else:
+                # Tolerantes Matching über die Beschreibungen im Lookup
+                for node_hash, node_obj in node_lookup.items():
+                    if node_obj.get("type") == "cluster_summary" and node_obj.get("description") == c_desc:
+                        start_hash = node_hash
+                        break
+
+            if start_hash and start_hash in atomic_graph:
+                # Queue speichert: (aktueller_knoten_hash, atomare_distanz_zum_cluster)
+                queue = deque([(start_hash, 0)])
+                local_visited = {start_hash}
+
+                while queue:
+                    current_hash, current_dist = queue.popleft()
+
+                    # Bei Distanz 2 sammeln wir die Nachbarn (welche dann Distanz 3 wären) nicht mehr
+                    if current_dist >= 2:
+                        continue
+
+                    for neighbor_hash in atomic_graph[current_hash]:
+                        if neighbor_hash not in local_visited:
+                            local_visited.add(neighbor_hash)
+
+                            neighbor_node = node_lookup.get(neighbor_hash)
+                            if neighbor_node:
+                                next_dist = current_dist + 1
+
+                                # Nur echte Fakten sammeln
+                                if neighbor_node.get("type") == "fact":
+                                    local_unique_nodes[
+                                        neighbor_hash] = f"[Distanz {next_dist}] {neighbor_node.get('description', '')}"
+
+                                queue.append((neighbor_hash, next_dist))
+
+            # Ausgabe der gefilterten Fakten für dieses Cluster
+            if local_unique_nodes:
+                # Sortierung nach Distanz für eine schönere UI-Hierarchie
+                sorted_nodes = sorted(local_unique_nodes.values(), key=lambda x: x.startswith("[Distanz 2]"))
+                node_lines = [f"  ├── 📌 {desc}" for desc in sorted_nodes]
+                cluster_block += "\n".join(node_lines)
+            else:
+                cluster_block += "  └── (Keine assoziierten Fakten im atomaren Radius 1-2 gefunden)"
+
+            trajectories_feedback_lines.append(cluster_block)
+
+        driver.close()
+
+        # Schritt D: Einzel-Fakten für das Context Window aufbereiten
         results_strings = []
-        for score, f in unique_top_matches:
-            results_strings.append(f"- ({f.get('type', 'fact')}) [Score: {score:.4f}]: {f.get('description', '')}")
+        for score, f in unique_top_facts:
+            results_strings.append(f"- [Score: {score:.4f}]: {f.get('description', '')}")
+
+        # Finalen Prompt-Kontext sauber zusammensetzen
+        feedback_block = "### 🛤️ Aktivierte Wissens-Cluster und deren Assoziationsketten:\n"
+        if trajectories_feedback_lines:
+            feedback_block += "\n".join(trajectories_feedback_lines)
+        else:
+            feedback_block += "- Keine Cluster-Summaries mit einem Score größer als 0.7 gefunden."
+
+        feedback_block += "\n\n### 📌 Top Einzel-Fakten:\n"
+        feedback_block += "\n".join(results_strings) if results_strings else "- Keine passenden Einzel-Fakten."
 
     else:
-        results_strings = []
+        feedback_block = "- No new entries processed."
 
-    feedback_block = "\n".join(results_strings) if results_strings else "- No highly similar context items found or no new entries processed."
+    print(chalk.blue(f"Feedback block: {feedback_block}"))
+
     return f"### Abstract ideas as feedback:\n{feedback_block}\n"
-
 
 # =====================================================================
 # AUXILIARY UTILS
@@ -751,3 +869,93 @@ def compute_topological_cluster_embeddings(session, unified_memory, shift_thresh
     # Speicher aktualisieren
     unified_memory['cluster_summaries'] = new_summaries
     return unified_memory
+
+
+def precompute_cluster_power_grid(driver, database, limit=30):
+    """
+    PHASE 1: Berechnet das globale, kreis- und redundanzfreie Stromnetzwerk.
+    Sichert über bidirektionale Spiegelung, dass absolut jedes Clusterknoten-Paar
+    optimal verdrahtet wird und schwache Knoten nicht durch starke Verdrängung isoliert werden.
+    """
+    query = """
+    // =====================================================================
+    // SUB-PHASE 1: Alle globalen Pfade ungerichtet finden und bewerten
+    // =====================================================================
+    MATCH path = (c1)-[*2..4]-(c2)
+    WHERE c1.type = "cluster_summary"
+      AND c2.type = "cluster_summary"
+      AND id(c1) < id(c2)
+      AND ALL(n IN nodes(path)[1..-1] WHERE n.type = "fact")
+      AND size([n IN nodes(path) | id(n)]) = size(reduce(s = [], n IN nodes(path) | CASE WHEN id(n) IN s THEN s ELSE s + id(n) END))
+
+    WITH path, c1, c2,
+         reduce(logScore = 0.0, r IN relationships(path) | logScore + log(r.score)) / size(relationships(path)) AS avg_log_score
+    WITH path, c1, c2, exp(avg_log_score) AS path_score
+
+    ORDER BY path_score DESC
+    WITH c1, c2, collect(path)[0] AS bester_pfad, collect(path_score)[0] AS bester_score
+
+    // =====================================================================
+    // SUB-PHASE 2: Echte bidirektionale Rettungsanker für JEDES Cluster sichern
+    // =====================================================================
+    WITH collect({fokus: c1, c1_hash: c1.hash, c2_hash: c2.hash, pfad: bester_pfad, score: bester_score}) +
+         collect({fokus: c2, c1_hash: c1.hash, c2_hash: c2.hash, pfad: bester_pfad, score: bester_score}) AS spiegel_liste
+
+    UNWIND spiegel_liste AS sicht
+    WITH sicht.fokus AS knoten, sicht
+    ORDER BY sicht.score DESC
+
+    WITH knoten, collect({c1_hash: sicht.c1_hash, c2_hash: sicht.c2_hash, pfad: sicht.pfad, score: sicht.score})[0] AS anker_pfad
+    WITH collect(anker_pfad {.*, ist_anker: true}) AS markierte_anker
+
+    // =====================================================================
+    // SUB-PHASE 3: Alle Pfade einsammeln und mit den Ankern verschmelzen
+    // =====================================================================
+    MATCH path = (c1)-[*2..4]-(c2)
+    WHERE c1.type = "cluster_summary"
+      AND c2.type = "cluster_summary"
+      AND id(c1) < id(c2)
+      AND ALL(n IN nodes(path)[1..-1] WHERE n.type = "fact")
+      AND size([n IN nodes(path) | id(n)]) = size(reduce(s = [], n IN nodes(path) | CASE WHEN id(n) IN s THEN s ELSE s + id(n) END))
+
+    WITH path, c1, c2, markierte_anker,
+         reduce(logScore = 0.0, r IN relationships(path) | logScore + log(r.score)) / size(relationships(path)) AS avg_log_score
+    WITH path, c1, c2, exp(avg_log_score) AS path_score, markierte_anker
+
+    ORDER BY path_score DESC
+    WITH c1, c2, collect(path)[0] AS bester_pfad, collect(path_score)[0] AS bester_score, markierte_anker
+
+    WITH {c1_hash: c1.hash, c2_hash: c2.hash, pfad: bester_pfad, score: bester_score, ist_anker: false} AS standard_pfad, markierte_anker
+    WHERE NOT ANY(anker IN markierte_anker WHERE anker.pfad = standard_pfad.pfad)
+
+    WITH markierte_anker, collect(standard_pfad) AS rest_pfade
+    WITH markierte_anker + rest_pfade AS alle_eindeutigen_pfade
+
+    UNWIND alle_eindeutigen_pfade AS element
+
+    // =====================================================================
+    // SUB-PHASE 4: Finale Sortierung (Anker werden zum Überleben gezwungen)
+    // =====================================================================
+    WITH element
+    ORDER BY element.ist_anker DESC, element.score DESC
+    LIMIT $limit
+
+    RETURN element.pfad AS path, 
+           element.c1_hash AS c1_hash, 
+           element.c2_hash AS c2_hash, 
+           element.score AS path_score
+    """
+    grid_trajectories = []
+    try:
+        with driver.session(database=database) as session:
+            result = session.run(query, limit=limit)
+            for record in result:
+                grid_trajectories.append({
+                    "path": record["path"],
+                    "c1_hash": record["c1_hash"],
+                    "c2_hash": record["c2_hash"],
+                    "score": record["path_score"]
+                })
+    except Exception as e:
+        print(f"⚠️ Fehler bei globaler Trajektorien-Extraktion: {e}")
+    return grid_trajectories

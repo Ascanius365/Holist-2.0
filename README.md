@@ -58,5 +58,5 @@ Micro:  The bot's intention to reach out to teammates Caleb and Kelly.
 ```
 
 <div align="center">
-  <img src="./birdseye_view.png" alt="Bot Perspektive" width="600">
+  <img src="./bots/Dylan/birdseye_view.png" alt="Bot Perspektive" width="600">
 </div>
